@@ -1,473 +1,723 @@
-"""
-Full definition of a GPT Language Model, all of it in this single file.
-References:
-1) the official GPT-2 TensorFlow implementation released by OpenAI:
-https://github.com/openai/gpt-2/blob/master/src/model.py
-2) huggingface/transformers PyTorch implementation:
-https://github.com/huggingface/transformers/blob/main/src/transformers/models/gpt2/modeling_gpt2.py
-"""
-
 import math
-import inspect
-from dataclasses import dataclass
+from typing import List
 
 import torch
 import torch.nn as nn
-from torch.nn import functional as F
 
-class LayerNorm(nn.Module):
-    """ LayerNorm but with an optional bias. PyTorch doesn't support simply bias=False """
 
-    def __init__(self, ndim, bias):
+class SinusoidalPositionalEncoding(nn.Module):
+    """
+    Implements sinusoidal positional encoding for transformer models.
+
+    This module adds positional information to input embeddings using sine and cosine
+    functions of different frequencies, allowing the model to learn about token positions
+    in a sequence without requiring training.
+
+    Args:
+        d_model (int): The dimension of the model's embeddings
+    """
+    def __init__(self, d_model: int):
         super().__init__()
-        self.weight = nn.Parameter(torch.ones(ndim))
-        self.bias = nn.Parameter(torch.zeros(ndim)) if bias else None
+        self.d_model = d_model
 
-    def forward(self, input):
-        return F.layer_norm(input, self.weight.shape, self.weight, self.bias, 1e-5)
+    def _get_positional_encoding(self, seq_len: int, device: torch.device) -> torch.Tensor:
+        """
+        Generates positional encodings for a sequence.
 
-class CausalSelfAttention(nn.Module):
+        Args:
+            seq_len (int): Length of the sequence
+            device (torch.device): Device to create the encodings on
 
-    def __init__(self, config):
-        super().__init__()
-        assert config.n_embd % config.n_head == 0
-        # key, query, value projections for all heads, but in a batch
-        self.c_attn = nn.Linear(config.n_embd, 3 * config.n_embd, bias=config.bias)
-        # output projection
-        self.c_proj = nn.Linear(config.n_embd, config.n_embd, bias=config.bias)
-        # regularization
-        self.attn_dropout = nn.Dropout(config.dropout)
-        self.resid_dropout = nn.Dropout(config.dropout)
-        self.n_head = config.n_head
-        self.n_embd = config.n_embd
-        self.dropout = config.dropout
+        Returns:
+            torch.Tensor: Positional encodings of shape [seq_len, d_model]
+        """
+        position = torch.arange(seq_len, dtype=torch.float, device=device).unsqueeze(1)
+        div_term = torch.exp(torch.arange(0, self.d_model, 2, dtype=torch.float, device=device) *
+                             (-math.log(10000.0) / self.d_model))
 
-        # flash attention make GPU go brrrrr but support is only in PyTorch >= 2.0
-        self.flash = hasattr(torch.nn.functional, 'scaled_dot_product_attention')
-        if not self.flash:
-            print("WARNING: using slow attention. Flash Attention requires PyTorch >= 2.0")
-            # causal mask to ensure that attention is only applied to the left in the input sequence
-            self.register_buffer("bias", torch.tril(torch.ones(config.block_size, config.block_size))
-                                        .view(1, 1, config.block_size, config.block_size))
+        pos_encoding = torch.zeros(seq_len, self.d_model, device=device)
+        pos_encoding[:, 0::2] = torch.sin(position * div_term)
+        pos_encoding[:, 1::2] = torch.cos(position * div_term)
 
-    def forward(self, x):
-        B, T, C = x.size() # batch size, sequence length, embedding dimensionality (n_embd)
+        return pos_encoding
 
-        # calculate query, key, values for all heads in batch and move head forward to be the batch dim
-        q, k, v  = self.c_attn(x).split(self.n_embd, dim=2)
-        k = k.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
-        q = q.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
-        v = v.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Adds positional encodings to the input embeddings.
 
-        # causal self-attention; Self-attend: (B, nh, T, hs) x (B, nh, hs, T) -> (B, nh, T, T)
-        if self.flash:
-            # efficient attention using Flash Attention CUDA kernels
-            y = torch.nn.functional.scaled_dot_product_attention(q, k, v, attn_mask=None, dropout_p=self.dropout if self.training else 0, is_causal=True)
-        else:
-            # manual implementation of attention
-            att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(k.size(-1)))
-            att = att.masked_fill(self.bias[:,:,:T,:T] == 0, float('-inf'))
-            att = F.softmax(att, dim=-1)
-            att = self.attn_dropout(att)
-            y = att @ v # (B, nh, T, T) x (B, nh, T, hs) -> (B, nh, T, hs)
-        y = y.transpose(1, 2).contiguous().view(B, T, C) # re-assemble all head outputs side by side
+        Args:
+            x (torch.Tensor): Input tensor of shape [batch_size, seq_len, d_model]
 
-        # output projection
-        y = self.resid_dropout(self.c_proj(y))
-        return y
+        Returns:
+            torch.Tensor: Input with positional encodings added
+        """
+        seq_len = x.size(1)
+        pos_encoding = self._get_positional_encoding(seq_len, x.device)
+        return x + pos_encoding.unsqueeze(0)
 
-class MemoryAttention(nn.Module):
-    def __init__(self, n_embd, n_head, dropout):
-        super().__init__()
-        self.n_embd = n_embd
-        self.n_head = n_head
-        self.dropout = dropout
+class BabyAutoencoder(nn.Module):
+    """
+    A simple transformer-based autoencoder with token masking capability.
 
-        # Linear layers to compute Q, K, V from the memory
-        self.query_proj = nn.Linear(n_embd, n_embd)
-        self.key_proj = nn.Linear(n_embd, n_embd)
-        self.value_proj = nn.Linear(n_embd, n_embd)
+    This autoencoder uses transformer encoder layers for both encoding and decoding,
+    with the ability to mask out tokens based on their importance scores.
 
-        self.attention_dropout = nn.Dropout(dropout)
-        self.out_proj = nn.Linear(n_embd, n_embd)
+    Args:
+        d_model (int): Dimension of the model
+        nhead (int): Number of attention heads
+        num_layers (int): Number of transformer layers
+        n_mask (int): Number of tokens to mask
+        norm (nn.Module, optional): Normalization layer
+    """
+    def __init__(self,
+                 d_model: int,
+                 nhead: int,
+                 num_layers: int,
+                 n_mask: int,
+                 norm: nn.Module = None
+                 ):
+        super(BabyAutoencoder, self).__init__()
 
-    def forward(self, x, memory):
-        B, T, C = x.shape
-        M = memory.shape[1]  # Memory length
+        self.pos_encoder = SinusoidalPositionalEncoding(d_model)
 
-        q = self.query_proj(x).view(B, T, self.n_head, C // self.n_head).transpose(1, 2)
-        k = self.key_proj(memory).view(B, M, self.n_head, C // self.n_head).transpose(1, 2)
-        v = self.value_proj(memory).view(B, M, self.n_head, C // self.n_head).transpose(1, 2)
+        self.encoder = nn.TransformerEncoder(
+            nn.TransformerEncoderLayer(
+                d_model=d_model,
+                nhead=nhead,
+                batch_first=True
+            ),
+            num_layers=num_layers,
+            norm=norm
+        )
+        self.decoder = nn.TransformerEncoder(
+            nn.TransformerEncoderLayer(
+                d_model=d_model,
+                nhead=nhead,
+                batch_first=True
+            ),
+            num_layers=num_layers,
+            norm=norm
+        )
 
-        att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(k.size(-1)))
-        att = F.softmax(att, dim=-1)
-        att = self.attention_dropout(att)
+        self.n_mask = n_mask
 
-        y = att @ v
-        y = y.transpose(1, 2).contiguous().view(B, T, C)
+        self.activation = nn.Tanh()
 
-        return self.out_proj(y)
+    def forward(self, x: torch.Tensor):
+        """
+        Performs full autoencoding cycle (encode + decode).
 
-class MLP(nn.Module):
+        Args:
+            x (torch.Tensor): Input tensor [batch_size, seq_len, d_model]
 
-    def __init__(self, config):
-        super().__init__()
-        self.c_fc    = nn.Linear(config.n_embd, 4 * config.n_embd, bias=config.bias)
-        self.gelu    = nn.GELU()
-        self.c_proj  = nn.Linear(4 * config.n_embd, config.n_embd, bias=config.bias)
-        self.dropout = nn.Dropout(config.dropout)
+        Returns:
+            torch.Tensor: Reconstructed input
+        """
+        x = self.pos_encoder(x)
+        x = self.encoder(x)
+        x = self.activation(x)
 
-    def forward(self, x):
-        x = self.c_fc(x)
-        x = self.gelu(x)
-        x = self.c_proj(x)
-        x = self.dropout(x)
+        if self.n_mask > 0:
+            # shape: [B, L]
+            scores = x.norm(dim=2)  # or x.mean(dim=2), etc.
+
+            # topk along dimension=1 (the length dimension)
+            _, token_indices = torch.topk(scores, self.n_mask, dim=1, largest=False)  # shape [B, n_mask]
+
+            mask = torch.zeros(x.shape[:2], dtype=torch.bool, device=x.device)  # shape [B, L]
+            mask.scatter_(1, token_indices, True)
+            mask = mask.unsqueeze(-1)  # shape [B, L, 1] => broadcastable to [B, L, D]
+            x = x.masked_fill(mask, 0.0)
+
+        x = self.decoder(x)
+
+        return x
+
+    def encode(self, x: torch.Tensor):
+        """
+        Encodes the input, including token masking.
+
+        Args:
+            x (torch.Tensor): Input tensor [batch_size, seq_len, d_model]
+
+        Returns:
+            torch.Tensor: Encoded representation
+        """
+        x = self.pos_encoder(x)
+        x = self.encoder(x)
+        x = self.activation(x)
+
+        if self.n_mask > 0:
+            # shape: [B, L]
+            scores = x.norm(dim=2)  # or x.mean(dim=2), etc.
+
+            # topk along dimension=1 (the length dimension)
+            _, token_indices = torch.topk(scores, self.n_mask, dim=1, largest=False)  # shape [B, n_mask]
+
+            mask = torch.zeros(x.shape[:2], dtype=torch.bool, device=x.device)  # shape [B, L]
+            mask.scatter_(1, token_indices, True)
+            mask = mask.unsqueeze(-1)  # shape [B, L, 1] => broadcastable to [B, L, D]
+            x = x.masked_fill(mask, 0.0)
+
+        return x
+
+    def decode(self, x: torch.Tensor):
+        """
+        Decodes the encoded representation.
+
+        Args:
+            x (torch.Tensor): Encoded tensor [batch_size, seq_len, d_model]
+
+        Returns:
+            torch.Tensor: Decoded output
+        """
+        x = self.decoder(x)
         return x
 
 
-class MemoryController(nn.Module):
-    def __init__(self, n_embd):
-        super().__init__()
-        self.fc1 = nn.Linear(n_embd, n_embd // 2)
-        self.relu = nn.ReLU()
-        self.fc2 = nn.Linear(n_embd // 2, 1)
-        self.sigmoid = nn.Sigmoid()
+class FissionModule(nn.Module):
+    """
+    Module that splits input sequence into multiple node-specific representations.
 
-    def forward(self, x):
-        gate_values = self.sigmoid(self.fc2(self.relu(self.fc1(x))))
-        gate_values = gate_values.expand_as(x)  # Expand to match embedding dimension
-        return gate_values
+    Uses learned queries and multi-head attention to create different views of the
+    input sequence for each node in the network.
 
+    Args:
+        num_nodes (int): Number of output nodes
+        par_length (int): Length of each partition
+        embedding_dim (int): Dimension of embeddings
+        num_heads (int): Number of attention heads
+        dropout (float): Dropout rate
+    """
+    def __init__(self, num_nodes: int, par_length: int, embedding_dim: int, num_heads: int, dropout: float):
+        super(FissionModule, self).__init__()
+        self.num_nodes = num_nodes
 
-# Adding it into Block
-class Block(nn.Module):
-    def __init__(self, config):
-        super().__init__()
-        self.ln_1 = LayerNorm(config.n_embd, bias=config.bias)
-        self.attn = CausalSelfAttention(config)
-        self.memory_attn = MemoryAttention(config.n_embd, config.n_head, config.dropout)
-        self.ln_2 = LayerNorm(config.n_embd, bias=config.bias)
-        self.ln_memory = LayerNorm(config.n_embd, bias=config.bias)  # New LayerNorm for memory output
-        self.mlp = MLP(config)
-        self.memory_update_gate = MemoryUpdateGate(config.n_embd, config.n_head)
-        self.memory_controller = MemoryController(config.n_embd)
+        # Initialize learned queries for each node
+        self.learned_queries = nn.Parameter(torch.randn(num_nodes, par_length, embedding_dim))
 
-    def forward(self, x, memory):
-        # Standard self-attention layer
-        x = x + self.attn(self.ln_1(x))
+        # Layer normalization before attention
+        self.norm = nn.LayerNorm(embedding_dim)
 
-        # Determine if memory should be used
-        use_memory_signal = self.memory_controller(x)
+        # Projections for Q, K, V
+        self.key_proj = nn.Linear(embedding_dim, embedding_dim)
+        self.value_proj = nn.Linear(embedding_dim, embedding_dim)
 
-        if memory is not None:
-            # Use memory only if the gate allows
-            memory_out = self.memory_attn(x, memory)  # Attend over memory
-            gated_memory_out = use_memory_signal * memory_out  # Gate memory usage element-wise
-            x = x + self.ln_memory(gated_memory_out)  # Normalize after adding memory contribution
+        # Single multi-head attention layer
+        self.attention = nn.MultiheadAttention(
+            embed_dim=embedding_dim,
+            num_heads=num_heads,
+            dropout=dropout,
+            batch_first=True
+        )
 
-            # Update the memory using the MemoryUpdateGate
-            memory = self.memory_update_gate(x, memory)
+        # Output projection and normalization
+        self.output_proj = nn.Linear(embedding_dim, embedding_dim)
+        self.output_norm = nn.LayerNorm(embedding_dim)
+        self.dropout = nn.Dropout(dropout)
 
-        # Standard MLP layer
-        x = x + self.mlp(self.ln_2(x))
-
-        return x, memory
-
-
-class MemoryUpdateGate(nn.Module):
-    def __init__(self, n_embd, n_head):
-        super().__init__()
-        self.n_embd = n_embd
-        self.n_head = n_head
-        self.query_proj = nn.Linear(n_embd, n_embd)
-        self.key_proj = nn.Linear(n_embd, n_embd)
-        self.value_proj = nn.Linear(n_embd, n_embd)
-        self.update_gate = nn.Linear(n_embd * 2, n_embd)
-        self.sigmoid = nn.Sigmoid()
-        self.ln = LayerNorm(n_embd, bias=True)
-
-    def forward(self, x, memory):
-        # Apply LayerNorm to stabilize input
-        x = self.ln(x)
-
-        # Project query, key, and value
-        q = self.query_proj(x)  # Shape: (batch_size, seq_len, n_embd)
-        k = self.key_proj(memory)  # Shape: (batch_size, memory_size, n_embd)
-        v = self.value_proj(memory)  # Shape: (batch_size, memory_size, n_embd)
-
-        # Compute attention scores between sequence and memory
-        attn_weights = F.softmax(torch.bmm(q, k.transpose(1, 2)) / math.sqrt(self.n_embd), dim=-1)  # Shape: (batch_size, seq_len, memory_size)
-
-        # Reduce attention weights to get a memory update score
-        # Take the average of attention scores across the sequence dimension for each memory slot
-        update_scores = torch.mean(attn_weights, dim=1, keepdim=True)  # Shape: (batch_size, 1, memory_size)
-        update_scores = update_scores.transpose(1, 2)  # Shape: (batch_size, memory_size, 1)
-
-        # Expand the update scores to match memory dimensions
-        update_scores = update_scores.expand_as(memory)  # Shape: (batch_size, memory_size, n_embd)
-
-        # Compute the updated memory
-        updated_memory = update_scores * x.mean(dim=1, keepdim=True) + (1 - update_scores) * memory
-
-        return updated_memory
-
-
-
-
-
-@dataclass
-class GPTConfig:
-    block_size: int = 1024
-    vocab_size: int = 50304 # GPT-2 vocab_size of 50257, padded up to nearest multiple of 64 for efficiency
-    n_layer: int = 12
-    n_head: int = 12
-    n_embd: int = 768
-    dropout: float = 0.0
-    bias: bool = True # True: bias in Linears and LayerNorms, like GPT-2. False: a bit better and faster
-    memory_size: int = 128
-
-class GPT(nn.Module):
-
-    def __init__(self, config):
-        super().__init__()
-        assert config.vocab_size is not None
-        assert config.block_size is not None
-        self.config = config
-
-        self.transformer = nn.ModuleDict(dict(
-            wte = nn.Embedding(config.vocab_size, config.n_embd),
-            wpe = nn.Embedding(config.block_size, config.n_embd),
-            drop = nn.Dropout(config.dropout),
-            h = nn.ModuleList([Block(config) for _ in range(config.n_layer)]),
-            ln_f = LayerNorm(config.n_embd, bias=config.bias),
-        ))
-        self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
-        # with weight tying when using torch.compile() some warnings get generated:
-        # "UserWarning: functional_call was passed multiple values for tied weights.
-        # This behavior is deprecated and will be an error in future versions"
-        # not 100% sure what this is, so far seems to be harmless. TODO investigate
-        self.transformer.wte.weight = self.lm_head.weight # https://paperswithcode.com/method/weight-tying
-
-        # init all weights
-        self.apply(self._init_weights)
-        # apply special scaled init to the residual projections, per GPT-2 paper
-        for pn, p in self.named_parameters():
-            if pn.endswith('c_proj.weight'):
-                torch.nn.init.normal_(p, mean=0.0, std=0.02/math.sqrt(2 * config.n_layer))
-
-        # report number of parameters
-        print("number of parameters: %.2fM" % (self.get_num_params()/1e6,))
-
-        # Memory
-        self.memory = None
-        self.memory_size = config.memory_size  # Number of memory slots to persist
-        self.memory_init = nn.Parameter(torch.zeros(1, config.memory_size, config.n_embd), requires_grad=True)
-
-    def get_num_params(self, non_embedding=True):
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
         """
-        Return the number of parameters in the model.
-        For non-embedding count (default), the position embeddings get subtracted.
-        The token embeddings would too, except due to the parameter sharing these
-        params are actually used as weights in the final layer, so we include them.
+        Splits input sequence into multiple node-specific representations.
+
+        Args:
+            x (torch.Tensor): Input tensor [batch_size, seq_len, embedding_dim]
+
+        Returns:
+            torch.Tensor: Node-specific representations [batch_size, num_nodes, seq_len, embedding_dim]
         """
-        n_params = sum(p.numel() for p in self.parameters())
-        if non_embedding:
-            n_params -= self.transformer.wpe.weight.numel()
-        return n_params
+        batch_size, seq_len, dim = x.shape
 
-    def _init_weights(self, module):
-        if isinstance(module, nn.Linear):
-            torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
-            if module.bias is not None:
-                torch.nn.init.zeros_(module.bias)
-        elif isinstance(module, nn.Embedding):
-            torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
+        # Normalize input
+        x = self.norm(x)
 
-    def forward(self, idx, targets=None):
-        device = idx.device
-        b, t = idx.size()
+        # Project keys and values
+        key = self.key_proj(x)
+        value = self.value_proj(x)
 
-        # Initialize memory if not already done
-        if self.memory is None or self.memory.size(0) != b:
-            self.memory = torch.zeros(b, self.memory_size, self.config.n_embd, device=device)
+        # Prepare queries for all nodes at once
+        # Shape: [B * N, L_q, D]
+        queries = self.learned_queries.unsqueeze(0).expand(
+            batch_size, -1, -1, -1
+        ).reshape(batch_size * self.num_nodes, -1, dim)
 
-        assert t <= self.config.block_size, f"Cannot forward sequence of length {t}, block size is only {self.config.block_size}"
-        pos = torch.arange(0, t, dtype=torch.long, device=device) # shape (t)
+        # Expand keys and values for parallel processing
+        # Shape: [B * N, L, D]
+        expanded_key = key.unsqueeze(1).expand(
+            -1, self.num_nodes, -1, -1
+        ).reshape(batch_size * self.num_nodes, seq_len, dim)
 
-        # forward the GPT model itself
-        tok_emb = self.transformer.wte(idx) # token embeddings of shape (b, t, n_embd)
-        pos_emb = self.transformer.wpe(pos) # position embeddings of shape (t, n_embd)
-        x = self.transformer.drop(tok_emb + pos_emb)
-        for block in self.transformer.h:
-            x, self.memory = block(x, self.memory)
-        x = self.transformer.ln_f(x)
+        expanded_value = value.unsqueeze(1).expand(
+            -1, self.num_nodes, -1, -1
+        ).reshape(batch_size * self.num_nodes, seq_len, dim)
 
-        if targets is not None:
-            # if we are given some desired targets also calculate the loss
-            logits = self.lm_head(x)
-            loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1)
-        else:
-            # inference-time mini-optimization: only forward the lm_head on the very last position
-            logits = self.lm_head(x[:, [-1], :]) # note: using list [-1] to preserve the time dim
-            loss = None
+        # Compute attention for all nodes in parallel
+        attn_output, _ = self.attention(
+            query=queries,
+            key=expanded_key,
+            value=expanded_value
+        )
 
-        return logits, loss
+        # Process output
+        attn_output = self.output_norm(queries + attn_output)
 
-    def crop_block_size(self, block_size):
-        # model surgery to decrease the block size if necessary
-        # e.g. we may load the GPT2 pretrained model checkpoint (block size 1024)
-        # but want to use a smaller block size for some smaller, simpler model
-        assert block_size <= self.config.block_size
-        self.config.block_size = block_size
-        self.transformer.wpe.weight = nn.Parameter(self.transformer.wpe.weight[:block_size])
-        for block in self.transformer.h:
-            if hasattr(block.attn, 'bias'):
-                block.attn.bias = block.attn.bias[:,:,:block_size,:block_size]
+        # Reshape back to [B, N, L_q, D]
+        output = attn_output.reshape(
+            batch_size, self.num_nodes, -1, dim
+        )
 
-    @classmethod
-    def from_pretrained(cls, model_type, override_args=None):
-        # Ensure the model type is one of the supported versions
-        assert model_type in {'gpt2', 'gpt2-medium', 'gpt2-large', 'gpt2-xl'}
-        override_args = override_args or {}  # default to empty dict
+        return output
 
-        # Only dropout can be overridden - enforce this restriction
-        assert all(k == 'dropout' for k in override_args)
-        from transformers import GPT2LMHeadModel
 
-        print(f"Loading weights from pretrained GPT model: {model_type}")
+class FusionModule(nn.Module):
+    """
+    Splits input sequence into multiple node-specific representations.
 
-        # Define the configuration for the desired GPT-2 variant
-        config_args = {
-            'gpt2': dict(n_layer=12, n_head=12, n_embd=768),  # 124M params
-            'gpt2-medium': dict(n_layer=24, n_head=16, n_embd=1024),  # 350M params
-            'gpt2-large': dict(n_layer=36, n_head=20, n_embd=1280),  # 774M params
-            'gpt2-xl': dict(n_layer=48, n_head=25, n_embd=1600),  # 1558M params
-        }[model_type]
+    Args:
+        x (torch.Tensor): Input tensor [batch_size, seq_len, embedding_dim]
 
-        # Override specific configurations if provided
-        config_args['vocab_size'] = 50257  # always 50257 for GPT model checkpoints
-        config_args['block_size'] = 1024  # always 1024 for GPT model checkpoints
-        config_args['bias'] = True  # always True for GPT model checkpoints
-        if 'dropout' in override_args:
-            print(f"Overriding dropout rate to {override_args['dropout']}")
-            config_args['dropout'] = override_args['dropout']
+    Returns:
+        torch.Tensor: Node-specific representations [batch_size, num_nodes, seq_len, embedding_dim]
+    """
+    def __init__(self, embedding_dim: int, num_heads: int, dropout: float):
+        super(FusionModule, self).__init__()
 
-        # Create a new configuration instance
-        config = GPTConfig(**config_args)
-        model = cls(config)
+        # Learned query for fusion
+        self.learned_query = nn.Parameter(torch.randn(embedding_dim))
 
-        # Load the Hugging Face GPT-2 model
-        model_hf = GPT2LMHeadModel.from_pretrained(model_type)
-        sd_hf = model_hf.state_dict()
+        # Input normalization
+        self.norm = nn.LayerNorm(embedding_dim)
 
-        # Load weights from the pretrained model into the custom model
-        sd = model.state_dict()
-        sd_keys = list(sd.keys())
-        sd_keys_hf = list(sd_hf.keys())
+        # Projections for K, V
+        self.key_proj = nn.Linear(embedding_dim, embedding_dim)
+        self.value_proj = nn.Linear(embedding_dim, embedding_dim)
 
-        # Ignore the buffer attributes that are not learnable parameters
-        sd_keys = [k for k in sd_keys if not k.endswith('.attn.bias')]
-        sd_keys_hf = [k for k in sd_keys_hf if not k.endswith('.attn.masked_bias')]
-        sd_keys_hf = [k for k in sd_keys_hf if not k.endswith('.attn.bias')]
+        # Attention mechanism
+        self.attention = nn.MultiheadAttention(
+            embed_dim=embedding_dim,
+            num_heads=num_heads,
+            dropout=dropout,
+            batch_first=True
+        )
 
-        # Handle weight transposition between GPT-2 and your modified GPT architecture
-        transposed = ['attn.c_attn.weight', 'attn.c_proj.weight', 'mlp.c_fc.weight', 'mlp.c_proj.weight']
+        # Output processing
+        self.output_proj = nn.Linear(embedding_dim, embedding_dim)
+        self.output_norm = nn.LayerNorm(embedding_dim)
+        self.dropout = nn.Dropout(dropout)
 
-        # Copy parameters over, taking into account shape mismatches and added layers
-        for k in sd_keys_hf:
-            # Skip if the layer is newly added and not present in Hugging Face's model
-            if k not in sd:
-                print(f"Skipping: {k} as it is not part of the modified model")
-                continue
-
-            if any(k.endswith(w) for w in transposed):
-                # Special treatment for the Conv1D weights we need to transpose
-                assert sd_hf[k].shape[::-1] == sd[k].shape, f"Shape mismatch for {k}"
-                with torch.no_grad():
-                    sd[k].copy_(sd_hf[k].t())
-            else:
-                # Vanilla copy over the other parameters
-                assert sd_hf[k].shape == sd[k].shape, f"Shape mismatch for {k}"
-                with torch.no_grad():
-                    sd[k].copy_(sd_hf[k])
-
-        # Initialize the memory-related parameters separately since they are not in pretrained checkpoints
-        if model.memory_init.requires_grad:
-            nn.init.normal_(model.memory_init, mean=0.0, std=0.02)
-
-        # Load the parameters into the model
-        model.load_state_dict(sd)
-
-        return model
-
-    def configure_optimizers(self, weight_decay, learning_rate, betas, device_type):
-        # start with all of the candidate parameters
-        param_dict = {pn: p for pn, p in self.named_parameters()}
-        # filter out those that do not require grad
-        param_dict = {pn: p for pn, p in param_dict.items() if p.requires_grad}
-        # create optim groups. Any parameters that is 2D will be weight decayed, otherwise no.
-        # i.e. all weight tensors in matmuls + embeddings decay, all biases and layernorms don't.
-        decay_params = [p for n, p in param_dict.items() if p.dim() >= 2]
-        nodecay_params = [p for n, p in param_dict.items() if p.dim() < 2]
-        optim_groups = [
-            {'params': decay_params, 'weight_decay': weight_decay},
-            {'params': nodecay_params, 'weight_decay': 0.0}
-        ]
-        num_decay_params = sum(p.numel() for p in decay_params)
-        num_nodecay_params = sum(p.numel() for p in nodecay_params)
-        print(f"num decayed parameter tensors: {len(decay_params)}, with {num_decay_params:,} parameters")
-        print(f"num non-decayed parameter tensors: {len(nodecay_params)}, with {num_nodecay_params:,} parameters")
-        # Create AdamW optimizer and use the fused version if it is available
-        fused_available = 'fused' in inspect.signature(torch.optim.AdamW).parameters
-        use_fused = fused_available and device_type == 'cuda'
-        extra_args = dict(fused=True) if use_fused else dict()
-        optimizer = torch.optim.AdamW(optim_groups, lr=learning_rate, betas=betas, **extra_args)
-        print(f"using fused AdamW: {use_fused}")
-
-        return optimizer
-
-    def estimate_mfu(self, fwdbwd_per_iter, dt):
-        """ estimate model flops utilization (MFU) in units of A100 bfloat16 peak FLOPS """
-        # first estimate the number of flops we do per iteration.
-        # see PaLM paper Appendix B as ref: https://arxiv.org/abs/2204.02311
-        N = self.get_num_params()
-        cfg = self.config
-        L, H, Q, T = cfg.n_layer, cfg.n_head, cfg.n_embd//cfg.n_head, cfg.block_size
-        flops_per_token = 6*N + 12*L*H*Q*T
-        flops_per_fwdbwd = flops_per_token * T
-        flops_per_iter = flops_per_fwdbwd * fwdbwd_per_iter
-        # express our flops throughput as ratio of A100 bfloat16 peak flops
-        flops_achieved = flops_per_iter * (1.0/dt) # per second
-        flops_promised = 312e12 # A100 GPU bfloat16 peak flops is 312 TFLOPS
-        mfu = flops_achieved / flops_promised
-        return mfu
-
-    @torch.no_grad()
-    def generate(self, idx, max_new_tokens, temperature=1.0, top_k=None):
+    def forward(self, x: torch.Tensor, seq_len: int) -> torch.Tensor:
         """
-        Take a conditioning sequence of indices idx (LongTensor of shape (b,t)) and complete
-        the sequence max_new_tokens times, feeding the predictions back into the model each time.
-        Most likely you'll want to make sure to be in model.eval() mode of operation for this.
+        Combines multiple node representations into a single sequence.
+
+        Args:
+            x (torch.Tensor): Input tensor [batch_size, num_nodes, seq_len, embedding_dim]
+            seq_len (int): Desired output sequence length
+
+        Returns:
+            torch.Tensor: Fused representation [batch_size, seq_len, embedding_dim]
         """
-        for _ in range(max_new_tokens):
-            # if the sequence context is growing too long we must crop it at block_size
-            idx_cond = idx if idx.size(1) <= self.config.block_size else idx[:, -self.config.block_size:]
-            # forward the model to get the logits for the index in the sequence
-            logits, _ = self(idx_cond)
-            # pluck the logits at the final step and scale by desired temperature
-            logits = logits[:, -1, :] / temperature
-            # optionally crop the logits to only the top k options
-            if top_k is not None:
-                v, _ = torch.topk(logits, min(top_k, logits.size(-1)))
-                logits[logits < v[:, [-1]]] = -float('Inf')
-            # apply softmax to convert logits to (normalized) probabilities
-            probs = F.softmax(logits, dim=-1)
-            # sample from the distribution
-            idx_next = torch.multinomial(probs, num_samples=1)
-            # append sampled index to the running sequence and continue
-            idx = torch.cat((idx, idx_next), dim=1)
+        batch_size, num_nodes, node_seq_len, dim = x.shape
 
-        return idx
+        # Normalize and reshape input
+        x = x.view(batch_size, -1, dim)
 
-    def reset_memory(self):
-        self.memory = None
+        x = self.norm(x)
+
+        # Project keys and values
+        key = self.key_proj(x)
+        value = self.value_proj(x)
+
+        # Prepare query
+        query = self.learned_query.view(1, 1, -1).expand(batch_size, seq_len, -1)
+
+        # Apply attention
+        attn_output, _ = self.attention(
+            query=query,
+            key=key,
+            value=value
+        )
+
+        # Process output
+        output = self.output_proj(attn_output)
+        output = self.dropout(output)
+        output = self.output_norm(output + query)  # Residual connection
+
+        return output
+
+
+
+
+class HAMABlock(nn.Module):
+    """
+    Hierarchical Attention-based Masked Autoencoder Block.
+
+    Combines fission, node-specific processing, and fusion operations into a single
+    processing block. Each block can mask different numbers of tokens and process
+    them through multiple parallel autoencoders.
+
+    Args:
+        num_nodes (int): Number of parallel processing nodes
+        partition_length (int): Length of each partition
+        embedding_dim (int): Dimension of embeddings
+        num_heads (int): Number of attention heads
+        dropout (float): Dropout rate
+        num_layers (int): Number of transformer layers
+        n_mask (int): Number of tokens to mask
+        norm (nn.Module, optional): Normalization layer
+    """
+    def __init__(self, num_nodes: int, partition_length: int, embedding_dim: int, num_heads: int, dropout: float, num_layers: int, n_mask: int, norm: nn.Module = None):
+        super(HAMABlock, self).__init__()
+        self.n_mask = n_mask
+        self.num_nodes = num_nodes
+
+        self.autoencoders: nn.ModuleList = nn.ModuleList([
+            BabyAutoencoder(
+                d_model=embedding_dim,
+                nhead=num_heads,
+                num_layers=num_layers,
+                n_mask=n_mask,
+                norm=norm
+            )
+            for _ in range(num_nodes)
+        ])
+
+        self.fission_module = FissionModule(
+            num_nodes=num_nodes,
+            par_length=partition_length,
+            embedding_dim=embedding_dim,
+            num_heads=num_heads,
+            dropout=dropout
+        )
+        self.fusion_module = FusionModule(
+            embedding_dim=embedding_dim,
+            num_heads=num_heads,
+            dropout=dropout
+        )
+
+    def forward(self, x: torch.Tensor):
+        """
+        Performs complete block processing (encode + decode).
+
+        Args:
+            x (torch.Tensor): Input tensor [batch_size, seq_len, embedding_dim]
+
+        Returns:
+            torch.Tensor: Processed output
+        """
+        # x has shape [B, L, D]
+        B = x.shape[0]
+        L = x.shape[1]
+        D = x.shape[2]
+
+        x = self.fission_module(x)
+        for i in range(self.num_nodes):
+            x[:, i] = self.autoencoders[i](x[:, i])
+        x = self.fusion_module(x, L)
+        return x
+
+    def encode(self, x: torch.Tensor):
+        """
+        Encodes input through fission, node processing, and fusion.
+
+        Args:
+            x (torch.Tensor): Input tensor [batch_size, seq_len, embedding_dim]
+
+        Returns:
+            torch.Tensor: Encoded representation
+        """
+        # x has shape [B, L, D]
+        B = x.shape[0]
+        L = x.shape[1]
+        D = x.shape[2]
+
+        x = self.fission_module(x)
+        for i in range(self.num_nodes):
+            x[:, i] = self.autoencoders[i].encode(x[:, i])
+        x = self.fusion_module(x, L - self.num_nodes * self.n_mask)
+        return x
+
+    def decode(self, x: torch.Tensor):
+        """
+        Decodes representation through fission, node processing, and fusion.
+
+        Args:
+            x (torch.Tensor): Encoded tensor [batch_size, seq_len, embedding_dim]
+
+        Returns:
+            torch.Tensor: Decoded output
+        """
+        # x has shape [B, L, D]
+        B = x.shape[0]
+        L = x.shape[1]
+        D = x.shape[2]
+
+        x = self.fission_module(x)
+        for i in range(self.num_nodes):
+            x[:, i] = self.autoencoders[i].decode(x[:, i])
+        x = self.fusion_module(x, L + self.num_nodes * self.n_mask)
+        return x
+
+
+class HAMA(nn.Module):
+    """
+    "Hama early, Hama often." - Joseph Anderson, 2021
+
+    Hierarchical Attention-based Masked Autoencoder (HAMA).
+
+    HAMA is an advanced transformer-based architecture that combines hierarchical processing,
+    parallel masked autoencoders, and attention mechanisms to learn robust representations
+    of sequential data. The architecture is designed to capture information at multiple
+    scales while maintaining computational efficiency.
+
+    Key Architectural Components:
+    1. Hierarchical Processing:
+        - Multiple layers process data at different scales
+        - Each layer can operate on different sequence lengths and feature granularities
+        - Information flows both up (encoding) and down (decoding) the hierarchy
+
+    2. Parallel Processing Nodes:
+        - Each layer contains multiple parallel processing nodes
+        - Nodes can specialize in different aspects of the input
+        - Node count typically decreases in higher layers (controlled by scaling factor)
+
+    3. Masked Autoencoding:
+        - Uses learned masking strategies to force robust feature learning
+        - Mask tokens based on their importance scores
+        - Progressive masking through layers helps build hierarchical representations
+
+    4. Fission-Fusion Mechanism:
+        - Fission: Splits input into multiple parallel streams using learned queries
+        - Node Processing: Each stream processed by specialized autoencoder
+        - Fusion: Recombines processed streams using attention mechanism
+
+    Training Dynamics:
+        - Bottom layers learn fine-grained features with more parallel processors
+        - Middle layers learn intermediate representations
+        - Top layers learn high-level abstract features with fewer processors
+        - Masking forces the model to learn robust and redundant representations
+        - Bidirectional information flow allows for both compression and reconstruction
+
+    Advantages:
+        - Scalable to long sequences through hierarchical processing
+        - Robust to noise through masked training
+        - Flexible architecture through configurable scaling factors
+        - Efficient parallel processing through node specialization
+        - Capable of both lossy and lossless reconstruction depending on configuration
+
+    Args:
+        embedding_dim (int): Dimension of embeddings used throughout the model
+        num_heads (int): Number of attention heads in transformer layers
+        dropout (float): Dropout rate for regularization
+        num_layers (int): Number of hierarchical HAMA layers
+        transformer_layers (int): Number of transformer layers per autoencoder
+        norm (nn.Module, optional): Normalization layer for transformers
+        initial_num_nodes (int, optional): Initial number of parallel processing nodes
+        initial_partition_length (int, optional): Initial sequence length per partition
+        initial_n_mask (int, optional): Initial number of tokens to mask
+        num_nodes_scaling_factor (float, optional): Factor to scale node count between layers
+            (typically < 1 to reduce nodes in higher layers)
+        partition_length_scaling_factor (float, optional): Factor to scale partition length
+            (typically > 1 to increase receptive field in higher layers)
+        n_mask_scaling_factor (float, optional): Factor to scale masking between layers
+        nodes_per_layer (List[int], optional): Explicit number of nodes for each layer
+        partition_lengths (List[int], optional): Explicit partition lengths for each layer
+        n_masks (List[int], optional): Explicit number of masks for each layer
+
+    Note:
+        The architecture can be configured either through:
+        1. Initial values and scaling factors (for geometric progression)
+        2. Explicit per-layer lists (for custom progression)
+        But not both simultaneously.
+
+    Example scaling configuration:
+        For a 3-layer HAMA with:
+        - initial_num_nodes = 8
+        - num_nodes_scaling_factor = 0.5
+        - initial_partition_length = 64
+        - partition_length_scaling_factor = 2.0
+
+        The resulting structure would be:
+        Layer 0: 8 nodes, partition length 64
+        Layer 1: 4 nodes, partition length 128
+        Layer 2: 2 nodes, partition length 256
+
+    Implementation Note:
+        This implementation follows the principle of "divide-and-conquer" through its
+        fission-fusion mechanism, allowing parallel processing while maintaining the
+        ability to capture long-range dependencies through the hierarchy.
+
+    Example usage:
+    >>> model = HAMA(
+    ...     embedding_dim=128,
+    ...     num_heads=8,
+    ...     dropout=0.1,
+    ...     num_layers=4,
+    ...     transformer_layers=2,
+    ...     initial_num_nodes=4,
+    ...     initial_partition_length=32,
+    ...     initial_n_mask=4,
+    ...     num_nodes_scaling_factor=0.5,
+    ...     partition_length_scaling_factor=2.0,
+    ...     n_mask_scaling_factor=1.0
+    ... )
+    >>> input_tensor = torch.randn(2, 64, 128)  # [batch_size, seq_len, embedding_dim]
+    >>> output = model(input_tensor)
+    """
+
+    def __init__(
+            self,
+            embedding_dim: int,
+            num_heads: int,
+            dropout: float,
+            num_layers: int,
+            transformer_layers: int,
+            norm: nn.Module = None,
+            initial_num_nodes: int = None,
+            initial_partition_length: int = None,
+            initial_n_mask: int = None,
+            num_nodes_scaling_factor: float = 0.5,
+            partition_length_scaling_factor: float = 2.0,
+            n_mask_scaling_factor: float = 1.0,
+            nodes_per_layer: List[int] = None,
+            partition_lengths: List[int] = None,
+            n_masks: List[int] = None
+    ):
+        super(HAMA, self).__init__()
+
+        # Validation
+        if initial_num_nodes is None and nodes_per_layer is None:
+            raise ValueError("Either initial_num_nodes or nodes_per_layer must be provided.")
+        if initial_partition_length is None and partition_lengths is None:
+            raise ValueError("Either initial_partition_length or partition_lengths must be provided.")
+        if initial_n_mask is None and n_masks is None:
+            raise ValueError("Either initial_n_mask or n_masks must be provided.")
+
+        # Check that if one of the scaling factors is provided, the corresponding parameter is not provided and vice versa
+        if nodes_per_layer is not None and initial_num_nodes is not None:
+            raise ValueError("Cannot provide both nodes_per_layer and initial_num_nodes.")
+        if partition_lengths is not None and initial_partition_length is not None:
+            raise ValueError("Cannot provide both partition_lengths and initial_partition_length.")
+        if n_masks is not None and initial_n_mask is not None:
+            raise ValueError("Cannot provide both n_masks and initial_n_mask.")
+
+        # Check that nodes_per_layer, partition_lengths, and n_masks have the length of num_layers
+        if nodes_per_layer is not None and len(nodes_per_layer) != num_layers:
+            raise ValueError("nodes_per_layer must have the same length as num_layers.")
+        if partition_lengths is not None and len(partition_lengths) != num_layers:
+            raise ValueError("partition_lengths must have the same length as num_layers.")
+        if n_masks is not None and len(n_masks) != num_layers:
+            raise ValueError("n_masks must have the same length as num_layers.")
+
+        # Additional validation for scaling factors
+        if num_nodes_scaling_factor <= 0:
+            raise ValueError("num_nodes_scaling_factor must be positive")
+        if partition_length_scaling_factor <= 0:
+            raise ValueError("partition_length_scaling_factor must be positive")
+        if n_mask_scaling_factor <= 0:
+            raise ValueError("n_mask_scaling_factor must be positive")
+
+        # Validate embedding dimension and heads
+        if embedding_dim % num_heads != 0:
+            raise ValueError("embedding_dim must be divisible by num_heads")
+
+        # Validate transformer layers
+        if transformer_layers < 1:
+            raise ValueError("transformer_layers must be at least 1")
+
+        # Calculate per-layer parameters
+        if nodes_per_layer is None:
+            nodes_per_layer = [
+                max(1, int(initial_num_nodes * (num_nodes_scaling_factor ** i)))
+                for i in range(num_layers)
+            ]
+
+        if partition_lengths is None:
+            partition_lengths = [
+                max(1, int(initial_partition_length * (partition_length_scaling_factor ** i)))
+                for i in range(num_layers)
+            ]
+
+        if n_masks is None:
+            n_masks = [
+                max(1, int(initial_n_mask * (n_mask_scaling_factor ** i)))
+                for i in range(num_layers)
+            ]
+
+        # Validate partition sizes against masking
+        for i in range(num_layers):
+            total_masked_tokens = sum(n_masks[j] for j in range(i + 1))
+            remaining_tokens = partition_lengths[i] - total_masked_tokens
+            if remaining_tokens <= 0:
+                raise ValueError(
+                    f"Layer {i}: After masking {total_masked_tokens} tokens, "
+                    f"partition length {partition_lengths[i]} is too small. "
+                    f"Need at least {total_masked_tokens + 1} tokens."
+                )
+
+        # Store configuration
+        self.num_layers = num_layers
+        self.embedding_dim = embedding_dim
+        self.num_heads = num_heads
+        self.transformer_layers = transformer_layers
+        self.nodes_per_layer = nodes_per_layer
+        self.partition_lengths = partition_lengths
+        self.n_masks = n_masks
+
+        # Create layers
+        self.layers = nn.ModuleList([
+            HAMABlock(
+                num_nodes=nodes_per_layer[i],
+                partition_length=partition_lengths[i],
+                embedding_dim=embedding_dim,
+                num_heads=num_heads,
+                dropout=dropout,
+                num_layers=transformer_layers,  # Now using the configurable parameter
+                n_mask=n_masks[i],
+                norm=norm
+            )
+            for i in range(num_layers)
+        ])
+
+    def forward(self, x: torch.Tensor):
+        """
+        Performs complete forward pass through all HAMA layers.
+
+        Args:
+            x (torch.Tensor): Input tensor [batch_size, seq_len, embedding_dim]
+
+        Returns:
+            torch.Tensor: Reconstructed output
+        """
+        for layer in self.layers:
+            x = layer.encode(x)
+        for layer in reversed(self.layers):
+            x = layer.decode(x)
+        return x
+
+    def encode(self, x: torch.Tensor):
+        """
+        Encodes input through all HAMA layers.
+
+        Args:
+            x (torch.Tensor): Input tensor [batch_size, seq_len, embedding_dim]
+
+        Returns:
+            torch.Tensor: Encoded representation
+        """
+        for layer in self.layers:
+            x = layer.encode(x)
+        return x
+
+    def decode(self, x: torch.Tensor):
+        """
+        Decodes representation through all HAMA layers in reverse order.
+
+        Args:
+            x (torch.Tensor): Encoded tensor [batch_size, seq_len, embedding_dim]
+
+        Returns:
+            torch.Tensor: Decoded output
+        """
+        for layer in reversed(self.layers):
+            x = layer.decode(x)
+        return x
