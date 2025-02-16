@@ -16,7 +16,7 @@ HAMA is an advanced transformer-based architecture that combines hierarchical pr
 
 ```bash
 pip install torch  # Required dependency
-git clone https://github.com/yourusername/hama.git
+git clone https://github.com/bugsiesegal/hama.git
 cd hama
 pip install -e .
 ```
