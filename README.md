@@ -174,4 +174,4 @@ If you use HAMA in your research, please cite:
 
 ## Contact
 
-For questions and feedback, please open an issue on GitHub or contact [maintainer email].
+For questions and feedback, please open an issue on GitHub or contact bugsie@segalnyc.com.
