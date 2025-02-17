@@ -124,10 +124,10 @@ class BabyAutoencoder(nn.Module):
             # topk along dimension=1 (the length dimension)
             _, token_indices = torch.topk(scores, self.n_mask, dim=1, largest=False)  # shape [B, n_mask]
 
-            mask = torch.zeros(x.shape[:2], dtype=torch.bool, device=x.device)  # shape [B, L]
-            mask.scatter_(1, token_indices, True)
-            mask = mask.unsqueeze(-1)  # shape [B, L, 1] => broadcastable to [B, L, D]
-            x = x.masked_fill(mask, 0.0)
+            mask = torch.zeros(x.shape[:2], dtype=torch.int, device=x.device)  # Use int instead of bool
+            mask.scatter_(1, token_indices, 1)  # 1 instead of True
+            mask = mask.unsqueeze(-1).to(x.dtype)  # Convert back to match x.dtype
+            x = x.masked_fill(mask.bool(), 0.0)  # Convert back to bool before masking
 
         x = self.decoder(x)
 
@@ -154,10 +154,10 @@ class BabyAutoencoder(nn.Module):
             # topk along dimension=1 (the length dimension)
             _, token_indices = torch.topk(scores, self.n_mask, dim=1, largest=False)  # shape [B, n_mask]
 
-            mask = torch.zeros(x.shape[:2], dtype=torch.bool, device=x.device)  # shape [B, L]
-            mask.scatter_(1, token_indices, True)
-            mask = mask.unsqueeze(-1)  # shape [B, L, 1] => broadcastable to [B, L, D]
-            x = x.masked_fill(mask, 0.0)
+            mask = torch.zeros(x.shape[:2], dtype=torch.int, device=x.device)  # Use int instead of bool
+            mask.scatter_(1, token_indices, 1)  # 1 instead of True
+            mask = mask.unsqueeze(-1).to(x.dtype)  # Convert back to match x.dtype
+            x = x.masked_fill(mask.bool(), 0.0)  # Convert back to bool before masking
 
         return x
 
