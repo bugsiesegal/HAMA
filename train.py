@@ -1,533 +1,397 @@
 import os
-import time
-from typing import Optional, Dict, Any, Tuple
+from typing import Optional, Dict, Any, Tuple, List, Union
 
 import torch
 import torch.nn as nn
 import torch.optim as optim
-from torch.utils.data import DataLoader
-from torch.optim.lr_scheduler import ReduceLROnPlateau
-import wandb
+from torch.utils.data import DataLoader, Dataset, random_split
+import pytorch_lightning as pl
+from pytorch_lightning.callbacks import ModelCheckpoint, EarlyStopping, LearningRateMonitor
+from pytorch_lightning.loggers import WandbLogger
+from pytorch_lightning.utilities.model_summary import ModelSummary
 from tqdm import tqdm
 
-
-class EarlyStopping:
-    """Early stopping to prevent overfitting"""
-
-    def __init__(self, patience: int = 7, min_delta: float = 0.0):
-        self.patience = patience
-        self.min_delta = min_delta
-        self.counter = 0
-        self.best_loss = None
-        self.early_stop = False
-
-    def __call__(self, val_loss: float) -> bool:
-        if self.best_loss is None:
-            self.best_loss = val_loss
-        elif val_loss > self.best_loss - self.min_delta:
-            self.counter += 1
-            if self.counter >= self.patience:
-                return True
-        else:
-            self.best_loss = val_loss
-            self.counter = 0
-        return False
+from model import HAMAForLanguageModeling, HAMA
 
 
-class HAMATrainer:
+class HAMALightningModule(pl.LightningModule):
     """
-    Trainer class for HAMA models.
+    PyTorch Lightning module for HAMA models.
 
-    Handles layerwise pre-training and end-to-end training, validation,
-    checkpointing, and logging.
-
-    Args:
-        model (nn.Module): HAMA model instance
-        train_loader (DataLoader): Training data loader
-        val_loader (DataLoader): Validation data loader
-        learning_rate (float): Initial learning rate
-        device (torch.device): Device to train on
-        checkpoint_dir (str): Directory to save checkpoints
-        use_wandb (bool): Whether to use Weights & Biases logging
-        layerwise_epochs (int): Number of epochs for layerwise pre-training
-        layerwise_lr (float): Learning rate for layerwise pre-training
+    Handles both layerwise pre-training and end-to-end training.
+    Now includes support for text tasks through dimension permutation.
     """
 
     def __init__(
             self,
             model: nn.Module,
-            train_loader: DataLoader,
-            val_loader: DataLoader,
             learning_rate: float = 1e-4,
-            device: torch.device = torch.device("cuda" if torch.cuda.is_available() else "cpu"),
-            checkpoint_dir: str = "checkpoints",
-            use_wandb: bool = False,
+            layerwise_lr: float = 1e-3,
             layerwise_epochs: int = 10,
-            layerwise_lr: float = 1e-3
+            weight_decay: float = 0.01,
+            layerwise_pretraining: bool = True,
+            criterion: Optional[nn.Module] = None
     ):
-        self.model = model.to(device)
-        self.train_loader = train_loader
-        self.val_loader = val_loader
-        self.device = device
-        self.checkpoint_dir = checkpoint_dir
-        self.use_wandb = use_wandb
-
-        # Create checkpoint directory if it doesn't exist
-        os.makedirs(checkpoint_dir, exist_ok=True)
-
+        super().__init__()
+        self.model = model
         self.learning_rate = learning_rate
-        self.layerwise_epochs = layerwise_epochs
         self.layerwise_lr = layerwise_lr
+        self.layerwise_epochs = layerwise_epochs
+        self.weight_decay = weight_decay
+        self.layerwise_pretraining = layerwise_pretraining
 
-        # Initialize optimizers and schedulers
-        self._init_optimizer_scheduler()
+        # Default criterion if none provided
+        if criterion is None:
+            # For language modeling tasks
+            if isinstance(model, HAMAForLanguageModeling):
+                criterion = nn.CrossEntropyLoss()
+            else:
+                criterion = nn.MSELoss()
 
-        # Loss function (MSE for reconstruction)
-        self.criterion = nn.MSELoss()
+        # Loss function
+        self.criterion = criterion
 
-        # Early stopping
-        self.early_stopping = EarlyStopping(patience=10)
+        # Determine if we're doing a text task based on the criterion type
+        self.is_text_task = isinstance(criterion, nn.CrossEntropyLoss)
 
-        # Training state
-        self.current_epoch = 0
-        self.best_val_loss = float('inf')
-        self.training_state = {
-            'best_val_loss': float('inf'),
-            'current_epoch': 0,
-            'no_improvement_count': 0
-        }
+        # Current training phase
+        self.current_phase = "main"  # "main" or "layerwise"
+        self.current_layer_idx = -1  # Only used during layerwise training
 
-    def save_checkpoint(self, is_best: bool = False) -> None:
-        """
-        Save model checkpoint.
+        # Save hyperparameters
+        self.save_hyperparameters(ignore=['model'])
 
-        Args:
-            is_best (bool): Whether this is the best model so far
-        """
-        checkpoint = {
-            'epoch': self.current_epoch,
-            'model_state_dict': self.model.state_dict(),
-            'optimizer_state_dict': self.optimizer.state_dict(),
-            'scheduler_state_dict': self.scheduler.state_dict(),
-            'best_val_loss': self.best_val_loss,
-            'training_state': self.training_state
-        }
+    def forward(self, x):
+        """Forward pass through the model"""
+        # If x is a dictionary, extract the input_ids
+        if isinstance(x, dict) and 'input_ids' in x:
+            return self.model(x['input_ids'])
+        else:
+            return self.model(x)
 
-        # Save regular checkpoint
-        checkpoint_path = os.path.join(
-            self.checkpoint_dir,
-            f'checkpoint_epoch_{self.current_epoch}.pt'
-        )
-        torch.save(checkpoint, checkpoint_path)
+    def configure_optimizers(self):
+        """Configure optimizers and LR schedulers"""
+        if self.current_phase == "layerwise":
+            # Handle both direct HAMA model and wrapped model
+            if isinstance(self.model, HAMAForLanguageModeling):
+                params = []
 
-        # Save best model if this is the best so far
-        if is_best:
-            best_path = os.path.join(self.checkpoint_dir, 'best_model.pt')
-            torch.save(checkpoint, best_path)
+                # For layer 0, include embedding parameters
+                if self.current_layer_idx == 0 and hasattr(self.model, 'embedding'):
+                    params.extend(self.model.embedding.parameters())
 
-    def load_checkpoint(self, checkpoint_path: str) -> None:
-        """
-        Load model checkpoint.
+                # Add the current layer parameters - access layers directly
+                params.extend(self.model.layers[self.current_layer_idx].parameters())
 
-        Args:
-            checkpoint_path (str): Path to checkpoint file
-        """
-        checkpoint = torch.load(checkpoint_path, map_location=self.device)
-
-        self.model.load_state_dict(checkpoint['model_state_dict'])
-        self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
-        self.scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
-        self.current_epoch = checkpoint['epoch']
-        self.best_val_loss = checkpoint['best_val_loss']
-        self.training_state = checkpoint['training_state']
-
-    def train_epoch(self) -> Dict[str, float]:
-        """
-        Train model for one epoch.
-
-        Returns:
-            Dict[str, float]: Training metrics
-        """
-        self.model.train()
-        total_loss = 0
-        num_batches = len(self.train_loader)
-
-        with tqdm(total=num_batches, desc=f'Epoch {self.current_epoch}') as pbar:
-            for batch_idx, batch in enumerate(self.train_loader):
-                # Move batch to device
-                batch = batch.to(self.device)
-
-                # Forward pass
-                self.optimizer.zero_grad()
-                output = self.model(batch)
-                loss = self.criterion(output, batch)
-
-                # Backward pass
-                loss.backward()
-
-                # Gradient clipping
-                torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
-
-                self.optimizer.step()
-
-                # Update metrics
-                total_loss += loss.item()
-
-                # Update progress bar
-                pbar.update(1)
-                pbar.set_postfix({'loss': loss.item()})
-
-        avg_loss = total_loss / num_batches
-        return {'train_loss': avg_loss}
-
-    def validate(self) -> Dict[str, float]:
-        """
-        Validate model on validation set.
-
-        Returns:
-            Dict[str, float]: Validation metrics
-        """
-        self.model.eval()
-        total_loss = 0
-        num_batches = len(self.val_loader)
-
-        with torch.no_grad():
-            for batch in self.val_loader:
-                batch = batch.to(self.device)
-                output = self.model(batch)
-                loss = self.criterion(output, batch)
-                total_loss += loss.item()
-
-        avg_loss = total_loss / num_batches
-        return {'val_loss': avg_loss}
-
-    def _init_optimizer_scheduler(self):
-        """Initialize optimizer and scheduler for current training phase"""
-        self.optimizer = optim.AdamW(
-            self.model.parameters(),
-            lr=self.learning_rate,
-            weight_decay=0.01
-        )
-        self.scheduler = ReduceLROnPlateau(
-            self.optimizer,
-            mode='min',
-            factor=0.5,
-            patience=5,
-            verbose=True
-        )
-
-    def _freeze_layers(self, up_to_layer: int):
-        """Freeze all layers except the specified one"""
-        for i, layer in enumerate(self.model.layers):
-            for param in layer.parameters():
-                param.requires_grad = (i == up_to_layer)
+                optimizer = optim.AdamW(
+                    params,
+                    lr=self.layerwise_lr,
+                    weight_decay=self.weight_decay
+                )
+            else:
+                # Original behavior for direct HAMA model
+                optimizer = optim.AdamW(
+                    self.model.layers[self.current_layer_idx].parameters(),
+                    lr=self.layerwise_lr,
+                    weight_decay=self.weight_decay
+                )
+            return optimizer
+        else:
+            # During main training, optimize all parameters
+            optimizer = optim.AdamW(
+                self.model.parameters(),
+                lr=self.learning_rate,
+                weight_decay=self.weight_decay
+            )
+            scheduler = optim.lr_scheduler.ReduceLROnPlateau(
+                optimizer,
+                mode='min',
+                factor=0.5,
+                patience=5,
+                verbose=True
+            )
+            return {
+                "optimizer": optimizer,
+                "lr_scheduler": {
+                    "scheduler": scheduler,
+                    "monitor": "val_loss",
+                    "interval": "epoch",
+                    "frequency": 1
+                }
+            }
 
     def _unfreeze_all_layers(self):
         """Unfreeze all layers for end-to-end training"""
-        for layer in self.model.layers:
-            for param in layer.parameters():
-                param.requires_grad = True
+        # Unfreeze all parameters in the entire model
+        for param in self.model.parameters():
+            param.requires_grad = True
 
-    def train_layer(self, layer_idx: int) -> Dict[str, float]:
-        """Train a single layer"""
-        self._freeze_layers(layer_idx)
+    def _main_training_step(self, batch, batch_idx):
+        """Regular end-to-end training step"""
+        # Extract input_ids if batch is a dictionary
+        if isinstance(batch, dict) and 'input_ids' in batch:
+            input_tensor = batch['input_ids']
+        else:
+            input_tensor = batch
 
-        # Initialize layer-specific optimizer with higher learning rate
-        self.optimizer = optim.AdamW(
-            self.model.layers[layer_idx].parameters(),
-            lr=self.layerwise_lr,
-            weight_decay=0.01
-        )
+        # Forward pass
+        output = self(batch)  # Using our updated forward method
 
-        history = {
-            'train_loss': [],
-            'val_loss': []
+        # Calculate loss based on task type
+        if self.is_text_task:
+            loss = self._compute_text_loss(output, input_tensor)
+        else:
+            loss = self.criterion(output, input_tensor)
+
+        self.log('train_loss', loss, prog_bar=True)
+        return loss
+
+    def _main_validation_step(self, batch, batch_idx):
+        """Regular end-to-end validation step"""
+        # Extract input_ids if batch is a dictionary
+        if isinstance(batch, dict) and 'input_ids' in batch:
+            input_tensor = batch['input_ids']
+        else:
+            input_tensor = batch
+
+        # Forward pass
+        output = self(batch)
+
+        # Calculate loss based on task type
+        if self.is_text_task:
+            loss = self._compute_text_loss(output, input_tensor)
+        else:
+            loss = self.criterion(output, input_tensor)
+
+        self.log('val_loss', loss, prog_bar=True, sync_dist=True)
+        return loss
+
+    def _compute_text_loss(self, logits, targets):
+        """
+        Compute loss for text tasks using dimension permutation.
+
+        This method handles the dimensional requirements for CrossEntropyLoss
+        by permuting dimensions rather than reshaping.
+
+        Args:
+            logits: Model output [batch_size, seq_len, vocab_size]
+            targets: Target tokens [batch_size, seq_len]
+
+        Returns:
+            loss: CrossEntropy loss
+        """
+        # Permute dimensions to match CrossEntropyLoss expectations
+        # From: [batch_size, seq_len, vocab_size]
+        # To:   [batch_size, vocab_size, seq_len]
+        logits = logits.permute(0, 2, 1)
+
+        # Calculate loss - CrossEntropyLoss expects:
+        # - Input: [N, C, d1, d2, ...] where C is the number of classes
+        # - Target: [N, d1, d2, ...] where N is the batch size
+        return self.criterion(logits, targets)
+
+    def _freeze_layers(self, up_to_layer: int):
+        """Freeze all layers except the specified one"""
+        # Handle both direct HAMA model and wrapped model
+        if isinstance(self.model, HAMAForLanguageModeling):
+            # Freeze/unfreeze embedding based on layer index
+            if hasattr(self.model, 'embedding'):
+                for param in self.model.embedding.parameters():
+                    param.requires_grad = (up_to_layer == 0)  # Only for first layer
+
+            # Freeze base model layers - access layers directly
+            for i, layer in enumerate(self.model.layers):
+                for param in layer.parameters():
+                    param.requires_grad = (i == up_to_layer)
+
+            # Always freeze LM head during layerwise training
+            if hasattr(self.model, 'lm_head'):
+                for param in self.model.lm_head.parameters():
+                    param.requires_grad = False
+        else:
+            # Original behavior for direct HAMA model
+            for i, layer in enumerate(self.model.layers):
+                for param in layer.parameters():
+                    param.requires_grad = (i == up_to_layer)
+
+    def _layerwise_training_step(self, batch, batch_idx):
+        """Layer-wise pre-training step"""
+        # Extract input_ids if batch is a dictionary
+        if isinstance(batch, dict) and 'input_ids' in batch:
+            x = batch['input_ids']
+        else:
+            x = batch
+
+        # Handle both direct HAMA model and wrapped model for layerwise training
+        if isinstance(self.model, HAMAForLanguageModeling):
+            # Embed input if we're using a language model
+            embed = self.model.embedding(x)
+            for prev_idx in range(self.current_layer_idx):
+                embed = self.model.layers[prev_idx].encode(embed)  # Access layers directly
+            for prev_idx in reversed(range(self.current_layer_idx)):
+                embed = self.model.layers[prev_idx].decode(embed)  # Access layers directly
+
+            # Forward pass through current layer - access layers directly
+            output = self.model.lm_head(self.model.layers[self.current_layer_idx](embed))
+        else:
+            y = x
+            for prev_idx in range(self.current_layer_idx):
+                y = self.model.layers[prev_idx].encode(y)
+            for prev_idx in reversed(range(self.current_layer_idx)):
+                y = self.model.layers[prev_idx].decode(y)
+
+            # Forward pass through current layer
+            output = self.model.layers[self.current_layer_idx](y)
+
+        # Compute loss (for text tasks, this should be a reconstruction loss during layerwise training)
+        if self.is_text_task:
+            loss = self._compute_text_loss(output, x)
+        else:
+            loss = self.criterion(output, x)
+        self.log(f'layer_{self.current_layer_idx}_train_loss', loss, prog_bar=True)
+        return loss
+
+    def _layerwise_validation_step(self, batch, batch_idx):
+        """Layer-wise pre-training validation step"""
+        # Extract input_ids if batch is a dictionary
+        if isinstance(batch, dict) and 'input_ids' in batch:
+            x = batch['input_ids']
+        else:
+            x = batch
+
+        # Handle both direct HAMA model and wrapped model
+        if isinstance(self.model, HAMAForLanguageModeling):
+            # Embed input if we're using a language model
+            embed = self.model.embedding(x)
+            for prev_idx in range(self.current_layer_idx):
+                embed = self.model.layers[prev_idx].encode(embed)  # Access layers directly
+            for prev_idx in reversed(range(self.current_layer_idx)):
+                embed = self.model.layers[prev_idx].decode(embed)
+
+            # Forward pass through current layer - access layers directly
+            output = self.model.lm_head(self.model.layers[self.current_layer_idx](embed))
+        else:
+            y = x
+            for prev_idx in range(self.current_layer_idx):
+                y = self.model.layers[prev_idx].encode(y)
+            for prev_idx in reversed(range(self.current_layer_idx)):
+                y = self.model.layers[prev_idx].decode(y)
+
+            # Forward pass through current layer
+            output = self.model.layers[self.current_layer_idx](y)
+
+        # Compute loss
+        if self.is_text_task:
+            loss = self._compute_text_loss(output, x)
+        else:
+            loss = self.criterion(output, x)
+        self.log(f'layer_{self.current_layer_idx}_val_loss', loss, prog_bar=True, sync_dist=True)
+        return loss
+
+    # Update these methods to handle both model types
+    def training_step(self, batch, batch_idx):
+        """Training step logic"""
+        if self.current_phase == "layerwise":
+            return self._layerwise_training_step(batch, batch_idx)
+        else:
+            return self._main_training_step(batch, batch_idx)
+
+    def validation_step(self, batch, batch_idx):
+        """Validation step logic"""
+        if self.current_phase == "layerwise":
+            return self._layerwise_validation_step(batch, batch_idx)
+        else:
+            return self._main_validation_step(batch, batch_idx)
+
+    def do_layerwise_pretraining(self, trainer: pl.Trainer, datamodule: pl.LightningDataModule) -> None:
+        """
+        Perform layerwise pre-training before the main training.
+
+        This version is compatible with older PyTorch Lightning versions.
+
+        Args:
+            trainer (pl.Trainer): PyTorch Lightning trainer
+            datamodule (pl.LightningDataModule): Data module
+        """
+        if not self.layerwise_pretraining:
+            return
+
+        original_max_epochs = trainer.max_epochs
+        original_callbacks = trainer.callbacks
+
+        # We'll use a simplified set of callbacks for layerwise training
+        layerwise_callbacks = [cb for cb in original_callbacks
+                               if not isinstance(cb, (EarlyStopping, ModelCheckpoint))]
+
+        # Determine number of layers based on model type - access layers directly
+        num_layers = len(self.model.layers)
+
+        # Get trainer version-compatible parameters
+        trainer_kwargs = {
+            'max_epochs': self.layerwise_epochs,
+            'callbacks': layerwise_callbacks,
+            'logger': trainer.logger,
         }
 
-        for epoch in range(self.layerwise_epochs):
-            # Training phase
-            self.model.train()
-            total_loss = 0
-            num_batches = len(self.train_loader)
+        # Handle version differences for accelerator and devices
+        if hasattr(trainer, 'accelerator'):
+            if isinstance(trainer.accelerator, str):
+                trainer_kwargs['accelerator'] = trainer.accelerator
 
-            with tqdm(total=num_batches, desc=f'Layer {layer_idx}, Epoch {epoch + 1}') as pbar:
-                for batch in self.train_loader:
-                    batch = batch.to(self.device)
+        # For older versions, check for gpus, tpu_cores, etc.
+        if hasattr(trainer, 'gpus'):
+            trainer_kwargs['gpus'] = trainer.gpus
+        if hasattr(trainer, 'tpu_cores'):
+            trainer_kwargs['tpu_cores'] = trainer.tpu_cores
 
-                    x = batch
-                    for prev_idx in range(layer_idx):
-                        x = self.model.layers[prev_idx].encode(x)
+        # For newer versions that use devices
+        if hasattr(trainer, 'devices'):
+            trainer_kwargs['devices'] = trainer.devices
 
-                    output = self.model.layers[layer_idx](x)
+        # Strategy parameter (if available)
+        if hasattr(trainer, 'strategy'):
+            trainer_kwargs['strategy'] = trainer.strategy
 
-                    # Reconstruction loss
-                    loss = self.criterion(output, x)
+        # Precision parameter
+        if hasattr(trainer, 'precision'):
+            trainer_kwargs['precision'] = trainer.precision
 
-                    # Backward pass
-                    self.optimizer.zero_grad()
-                    loss.backward()
-                    torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
-                    self.optimizer.step()
+        for layer_idx in range(num_layers):
+            print(f"\nPre-training layer {layer_idx}")
 
-                    total_loss += loss.item()
-                    pbar.update(1)
-                    pbar.set_postfix({'loss': loss.item()})
+            # Set up for this layer
+            self.current_phase = "layerwise"
+            self.current_layer_idx = layer_idx
+            self._freeze_layers(layer_idx)
 
-            avg_train_loss = total_loss / num_batches
+            # Configure a temporary trainer for this layer with version-compatible parameters
+            layer_trainer = pl.Trainer(**trainer_kwargs)
 
-            # Validation phase
-            val_metrics = self.validate_layer(layer_idx)
+            # Train this layer
+            layer_trainer.fit(self, datamodule=datamodule)
 
-            if self.use_wandb:
-                wandb.log({
-                    f'layer_{layer_idx}_train_loss': avg_train_loss,
-                    f'layer_{layer_idx}_val_loss': val_metrics['val_loss']
-                })
+            print(f"Completed pre-training for layer {layer_idx}")
 
-            history['train_loss'].append(avg_train_loss)
-            history['val_loss'].append(val_metrics['val_loss'])
+        # Reset for main training
+        self.current_phase = "main"
+        self.current_layer_idx = -1
+        self._unfreeze_all_layers()
 
-        return history
+        # Reconfigure optimizer for main training
+        self.trainer = trainer  # To ensure we can access the trainer in configure_optimizers
 
-    def validate_layer(self, layer_idx: int) -> Dict[str, float]:
-        """Validate a single layer"""
-        self.model.eval()
-        total_loss = 0
-        num_batches = len(self.val_loader)
+    def encode(self, x: torch.Tensor) -> torch.Tensor:
+        """Generate encodings/representations"""
+        return self.model.encode(x)
 
-        with torch.no_grad():
-            for batch in self.val_loader:
-                batch = batch.to(self.device)
-
-                # Forward pass through all layers up to current
-                x = batch
-                for prev_idx in range(layer_idx):
-                    x = self.model.layers[prev_idx].encode(x)
-
-                output = self.model.layers[layer_idx](x)
-
-                loss = self.criterion(output, x)
-                total_loss += loss.item()
-
-        return {'val_loss': total_loss / num_batches}
-
-    def train(
-            self,
-            num_epochs: int,
-            checkpoint_frequency: int = 5,
-            early_stopping: bool = True,
-            skip_layerwise: bool = False
-    ) -> Dict[str, Any]:
-        """
-        Train model for specified number of epochs.
-
-        Args:
-            num_epochs (int): Number of epochs to train
-            checkpoint_frequency (int): How often to save checkpoints
-            early_stopping (bool): Whether to use early stopping
-
-        Returns:
-            Dict[str, Any]: Training history
-        """
-        history = {
-            'train_loss': [],
-            'val_loss': [],
-            'learning_rates': []
-        }
-
-        # Layerwise pre-training
-        if not skip_layerwise:
-            print("\nStarting layerwise pre-training...")
-            for layer_idx in range(len(self.model.layers)):
-                print(f"\nPre-training layer {layer_idx}")
-                layer_history = self.train_layer(layer_idx)
-                if self.use_wandb:
-                    wandb.log({
-                        f'layer_{layer_idx}_final_train_loss': layer_history['train_loss'][-1],
-                        f'layer_{layer_idx}_final_val_loss': layer_history['val_loss'][-1]
-                    })
-
-            # Reset optimizer and scheduler for end-to-end training
-            self._unfreeze_all_layers()
-            self._init_optimizer_scheduler()
-            print("\nStarting end-to-end training...")
-
-        # Initialize W&B if requested
-        if self.use_wandb:
-            wandb.watch(self.model)
-
-        for epoch in range(self.current_epoch, num_epochs):
-            self.current_epoch = epoch
-            epoch_start_time = time.time()
-
-            # Training phase
-            train_metrics = self.train_epoch()
-
-            # Validation phase
-            val_metrics = self.validate()
-
-            # Update learning rate scheduler
-            self.scheduler.step(val_metrics['val_loss'])
-
-            # Update history
-            history['train_loss'].append(train_metrics['train_loss'])
-            history['val_loss'].append(val_metrics['val_loss'])
-            history['learning_rates'].append(
-                self.optimizer.param_groups[0]['lr']
-            )
-
-            # Log metrics
-            epoch_time = time.time() - epoch_start_time
-            print(f"\nEpoch {epoch + 1}/{num_epochs}")
-            print(f"Train Loss: {train_metrics['train_loss']:.6f}")
-            print(f"Val Loss: {val_metrics['val_loss']:.6f}")
-            print(f"Epoch time: {epoch_time:.2f}s")
-
-            if self.use_wandb:
-                wandb.log({
-                    'epoch': epoch,
-                    'train_loss': train_metrics['train_loss'],
-                    'val_loss': val_metrics['val_loss'],
-                    'learning_rate': self.optimizer.param_groups[0]['lr']
-                })
-
-            # Save checkpoint if this is the best model so far
-            if val_metrics['val_loss'] < self.best_val_loss:
-                self.best_val_loss = val_metrics['val_loss']
-                self.save_checkpoint(is_best=True)
-                self.training_state['no_improvement_count'] = 0
-            else:
-                self.training_state['no_improvement_count'] += 1
-
-            # Regular checkpoint saving
-            if (epoch + 1) % checkpoint_frequency == 0:
-                self.save_checkpoint()
-
-            # Early stopping check
-            if early_stopping and self.early_stopping(val_metrics['val_loss']):
-                print(f"\nEarly stopping triggered after {epoch + 1} epochs")
-                break
-
-        return history
-
-    def predict(
-            self,
-            input_data: torch.Tensor,
-            batch_size: Optional[int] = None
-    ) -> torch.Tensor:
-        """
-        Generate predictions using the trained model.
-
-        Args:
-            input_data (torch.Tensor): Input data
-            batch_size (Optional[int]): Batch size for prediction
-
-        Returns:
-            torch.Tensor: Model predictions
-        """
-        self.model.eval()
-
-        if batch_size is None:
-            # If no batch size specified, process all at once
-            with torch.no_grad():
-                input_data = input_data.to(self.device)
-                predictions = self.model(input_data)
-            return predictions.cpu()
-
-        # Process in batches
-        predictions = []
-        num_samples = len(input_data)
-
-        for i in range(0, num_samples, batch_size):
-            batch = input_data[i:i + batch_size].to(self.device)
-            with torch.no_grad():
-                batch_predictions = self.model(batch)
-            predictions.append(batch_predictions.cpu())
-
-        return torch.cat(predictions, dim=0)
-
-    def encodings(
-            self,
-            input_data: torch.Tensor,
-            batch_size: Optional[int] = None
-    ) -> torch.Tensor:
-        """
-        Generate representations using the trained model.
-
-        Args:
-            input_data (torch.Tensor): Input data
-            batch_size (Optional[int]): Batch size for prediction
-
-        Returns:
-            torch.Tensor: Model representations
-        """
-        self.model.eval()
-
-        if batch_size is None:
-            # If no batch size specified, process all at once
-            with torch.no_grad():
-                input_data = input_data.to(self.device)
-                representations = self.model.encode(input_data)
-            return representations.cpu()
-
-        # Process in batches
-        representations = []
-        num_samples = len(input_data)
-
-        for i in range(0, num_samples, batch_size):
-            batch = input_data[i:i + batch_size].to(self.device)
-            with torch.no_grad():
-                batch_representations = self.model.encode(batch)
-            representations.append(batch_representations.cpu())
-
-        return torch.cat(representations, dim=0)
-
-    def decodings(
-            self,
-            input_data: torch.Tensor,
-            batch_size: Optional[int] = None
-    ) -> torch.Tensor:
-        """
-        Generate reconstructions using the trained model.
-
-        Args:
-            input_data (torch.Tensor): Input data
-            batch_size (Optional[int]): Batch size for prediction
-
-        Returns:
-            torch.Tensor: Model reconstructions
-        """
-        self.model.eval()
-
-        if batch_size is None:
-            # If no batch size specified, process all at once
-            with torch.no_grad():
-                input_data = input_data.to(self.device)
-                reconstructions = self.model.decode(input_data)
-            return reconstructions.cpu()
-
-        # Process in batches
-        reconstructions = []
-        num_samples = len(input_data)
-
-        for i in range(0, num_samples, batch_size):
-            batch = input_data[i:i + batch_size].to(self.device)
-            with torch.no_grad():
-                batch_reconstructions = self.model.decode(batch)
-            reconstructions.append(batch_reconstructions.cpu())
-
-        return torch.cat(reconstructions, dim=0)
+    def decode(self, x: torch.Tensor) -> torch.Tensor:
+        """Generate decodings/reconstructions"""
+        return self.model.decode(x)
 
 
-def prepare_dataloaders(
-        dataset: torch.utils.data.Dataset,
-        batch_size: int,
-        val_split: float = 0.2,
-        num_workers: int = 4,
-        seed: int = 42
-) -> Tuple[DataLoader, DataLoader]:
+class HAMADataModule(pl.LightningDataModule):
     """
-    Prepare training and validation dataloaders.
+    PyTorch Lightning data module for HAMA training.
 
     Args:
         dataset (Dataset): Full dataset
@@ -535,36 +399,203 @@ def prepare_dataloaders(
         val_split (float): Validation split ratio
         num_workers (int): Number of workers for data loading
         seed (int): Random seed for reproducibility
+    """
+
+    def __init__(
+            self,
+            dataset: Dataset,
+            batch_size: int = 32,
+            val_split: float = 0.2,
+            num_workers: int = 4,
+            seed: int = 42
+    ):
+        super().__init__()
+        self.dataset = dataset
+        self.batch_size = batch_size
+        self.val_split = val_split
+        self.num_workers = num_workers
+        self.seed = seed
+        self.train_dataset = None
+        self.val_dataset = None
+
+    def setup(self, stage: Optional[str] = None):
+        """Prepare datasets"""
+        if self.train_dataset is None or self.val_dataset is None:
+            # Calculate split sizes
+            val_size = int(len(self.dataset) * self.val_split)
+            train_size = len(self.dataset) - val_size
+
+            # Split dataset
+            self.train_dataset, self.val_dataset = random_split(
+                self.dataset,
+                [train_size, val_size],
+                generator=torch.Generator().manual_seed(self.seed)
+            )
+
+    def train_dataloader(self):
+        """Training dataloader"""
+        return DataLoader(
+            self.train_dataset,
+            batch_size=self.batch_size,
+            shuffle=True,
+            num_workers=self.num_workers,
+            pin_memory=True
+        )
+
+    def val_dataloader(self):
+        """Validation dataloader"""
+        return DataLoader(
+            self.val_dataset,
+            batch_size=self.batch_size,
+            shuffle=False,
+            num_workers=self.num_workers,
+            pin_memory=True
+        )
+
+
+def create_hama_for_text(
+        embedding_dim,
+        num_heads,
+        dropout,
+        num_layers,
+        transformer_layers,
+        initial_num_nodes,
+        initial_partition_length,
+        initial_n_mask,
+        num_nodes_scaling_factor,
+        partition_length_scaling_factor,
+        n_mask_scaling_factor,
+        vocab_size,
+        compression_factor=1,
+        use_masking=False,
+):
+    """
+    Create a HAMA model configured for text tasks.
 
     Returns:
-        Tuple[DataLoader, DataLoader]: Training and validation dataloaders
+        HAMAForLanguageModeling: HAMA model wrapped for language modeling
     """
-    # Calculate split sizes
-    val_size = int(len(dataset) * val_split)
-    train_size = len(dataset) - val_size
-
-    # Split dataset
-    train_dataset, val_dataset = torch.utils.data.random_split(
-        dataset,
-        [train_size, val_size],
-        generator=torch.Generator().manual_seed(seed)
+    # Create base HAMA model without embedding
+    hama_base = HAMA(
+        embedding_dim=embedding_dim,
+        num_heads=num_heads,
+        dropout=dropout,
+        num_layers=num_layers,
+        transformer_layers=transformer_layers,
+        initial_num_nodes=initial_num_nodes,
+        initial_partition_length=initial_partition_length,
+        initial_n_mask=initial_n_mask,
+        num_nodes_scaling_factor=num_nodes_scaling_factor,
+        partition_length_scaling_factor=partition_length_scaling_factor,
+        n_mask_scaling_factor=n_mask_scaling_factor,
+        compression_factor=compression_factor,
+        use_masking=use_masking,
+        # No external embedding here
     )
 
-    # Create dataloaders
-    train_loader = DataLoader(
-        train_dataset,
+    # Wrap with language modeling components
+    return HAMAForLanguageModeling(
+        hama_base=hama_base,
+        vocab_size=vocab_size,
+        embedding_dim=embedding_dim
+    )
+
+
+def train_hama_model(
+        model: nn.Module,
+        dataset: Dataset,
+        batch_size: int = 32,
+        val_split: float = 0.2,
+        num_workers: int = 4,
+        learning_rate: float = 1e-4,
+        layerwise_lr: float = 1e-3,
+        layerwise_epochs: int = 10,
+        num_epochs: int = 100,
+        text_task: bool = False,
+        vocab_size: int = None,
+        checkpoint_dir: str = "checkpoints",
+        use_wandb: bool = False,
+        layerwise_pretraining: bool = True,
+        early_stopping_patience: int = 10,
+        accelerator: str = "auto",
+        devices: Union[int, List[int], str] = "auto",
+        strategy: str = "auto",
+        precision: str = "16-mixed"
+) -> Dict[str, Any]:
+    """
+    Train a HAMA model using PyTorch Lightning.
+
+    For text tasks, the model should either:
+    1. Already be a HAMAForLanguageModeling instance
+    2. Be a base HAMA model that will be wrapped with HAMAForLanguageModeling
+    """
+
+    # Create criterion based on task type
+    criterion = nn.CrossEntropyLoss() if text_task else nn.MSELoss()
+
+    # Create Lightning module
+    pl_model = HAMALightningModule(
+        model=model,
+        learning_rate=learning_rate,
+        layerwise_lr=layerwise_lr,
+        layerwise_epochs=layerwise_epochs,
+        layerwise_pretraining=layerwise_pretraining,
+        criterion=criterion
+    )
+
+    # Create data module
+    data_module = HAMADataModule(
+        dataset=dataset,
         batch_size=batch_size,
-        shuffle=True,
-        num_workers=num_workers,
-        pin_memory=True
+        val_split=val_split,
+        num_workers=num_workers
     )
 
-    val_loader = DataLoader(
-        val_dataset,
-        batch_size=batch_size,
-        shuffle=False,
-        num_workers=num_workers,
-        pin_memory=True
+    # Set up callbacks
+    callbacks = [
+        EarlyStopping(
+            monitor='val_loss',
+            patience=early_stopping_patience,
+            mode='min'
+        ),
+        ModelCheckpoint(
+            dirpath=checkpoint_dir,
+            filename='hama-{epoch:02d}-{val_loss:.6f}',
+            save_top_k=3,
+            monitor='val_loss',
+            mode='min',
+            save_last=True
+        ),
+        LearningRateMonitor(logging_interval='epoch')
+    ]
+
+    # Set up logger
+    logger = WandbLogger(project="hama-training") if use_wandb else True
+
+    # Create trainer
+    trainer = pl.Trainer(
+        max_epochs=num_epochs,
+        callbacks=callbacks,
+        logger=logger,
+        accelerator=accelerator,
+        devices=devices,
+        strategy=strategy,
+        precision=precision,
+        gradient_clip_val=1.0,
+        log_every_n_steps=10,
+        deterministic=False  # For better performance
     )
 
-    return train_loader, val_loader
+    # Perform layerwise pre-training if requested
+    if layerwise_pretraining:
+        pl_model.do_layerwise_pretraining(trainer, data_module)
+
+    # Train model
+    trainer.fit(pl_model, datamodule=data_module)
+
+    return {
+        "model": pl_model,
+        "trainer": trainer,
+        "best_model_path": trainer.checkpoint_callback.best_model_path,
+        "best_model_score": trainer.checkpoint_callback.best_model_score
+    }
