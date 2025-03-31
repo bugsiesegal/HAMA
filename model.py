@@ -3,6 +3,7 @@ from typing import List
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 
 class SinusoidalPositionalEncoding(nn.Module):
@@ -169,7 +170,7 @@ class BabyAutoencoder(nn.Module):
         self.n_mask = n_mask
         self.use_masking = use_masking
 
-        self.activation = nn.Tanh()
+        self.activation = nn.Identity()
 
     def forward(self, x: torch.Tensor):
         """
@@ -266,12 +267,14 @@ class FissionModule(nn.Module):
         self.num_nodes = num_nodes
         self.par_length = par_length
 
+        self.pos_encoder = SinusoidalPositionalEncoding(embedding_dim)
+
         # Layer normalization before attention
         self.norm = nn.LayerNorm(embedding_dim)
 
         # Projections for K, V
-        self.key_proj = nn.Linear(embedding_dim, embedding_dim)
-        self.value_proj = nn.Linear(embedding_dim, embedding_dim)
+        self.key_proj = nn.Linear(embedding_dim, embedding_dim, bias=True)
+        self.value_proj = nn.Linear(embedding_dim, embedding_dim, bias=True)
 
         # Single multi-head attention layer
         self.attention = nn.MultiheadAttention(
@@ -282,58 +285,59 @@ class FissionModule(nn.Module):
         )
 
         # Output projection and normalization
-        self.output_proj = nn.Linear(embedding_dim, embedding_dim)
+        self.output_proj = nn.Linear(embedding_dim, embedding_dim, bias=True)
         self.output_norm = nn.LayerNorm(embedding_dim)
         self.dropout = nn.Dropout(dropout)
 
+        self.ffn = nn.Sequential(
+            nn.Linear(embedding_dim, 4 * embedding_dim, bias=True),
+            nn.ReLU(),
+            nn.Linear(4 * embedding_dim, embedding_dim, bias=True),
+        )
+        self.ffn_norm = nn.LayerNorm(embedding_dim)
+
+        self.query_pool = nn.AdaptiveAvgPool1d(par_length * num_nodes)
+        self.pooled_query_proj = nn.Linear(embedding_dim, embedding_dim)
+
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """
-        Splits input sequence into multiple node-specific representations.
-
-        Args:
-            x (torch.Tensor): [batch_size, seq_len, embedding_dim]
-
-        Returns:
-            torch.Tensor: Node-specific reps [batch_size, num_nodes, par_length, embedding_dim]
-        """
         batch_size, seq_len, dim = x.shape
 
-        # Normalize input
-        x = self.norm(x)
+        x_norm = self.norm(x)
+        x_pos = self.pos_encoder(x_norm) # Pos encoding after norm
 
-        # Project keys and values
-        key = self.key_proj(x)      # [B, L, D]
-        value = self.value_proj(x)  # [B, L, D]
+        key = self.key_proj(x_pos)
+        value = self.value_proj(x_pos)
 
-        # Prepare queries for all nodes
-        #   shape = [B * num_nodes, par_length, D]
-        queries = (build_2d_sin_encoding(self.num_nodes, self.par_length, dim, x.device)
-                   .unsqueeze(0)
-                   .expand(batch_size, -1, -1, -1)
-                   .reshape(batch_size * self.num_nodes, self.par_length, dim))
+        # --- Generate Queries from Input x ---
+        # 1. Pool the sequence dimension (L) to the target query length (N*P)
+        #    Input to pooling needs shape [B, D, L]
+        pooled_x = self.query_pool(x_pos.permute(0, 2, 1)) # Output shape [B, D, target_query_len]
 
-        # Expand keys and values
-        #   shape = [B * num_nodes, L, D]
-        expanded_key = key.unsqueeze(1).expand(-1, self.num_nodes, -1, -1)
-        expanded_key = expanded_key.reshape(batch_size * self.num_nodes, seq_len, dim)
+        # 2. Permute back and project
+        #    Shape back to [B, target_query_len, D]
+        pooled_x = pooled_x.permute(0, 2, 1)
+        queries = self.pooled_query_proj(pooled_x) # Shape [B, target_query_len, D]
 
-        expanded_value = value.unsqueeze(1).expand(-1, self.num_nodes, -1, -1)
-        expanded_value = expanded_value.reshape(batch_size * self.num_nodes, seq_len, dim)
+        # --- Attention ---
+        # query shape = [B, N*P, D]
+        # key shape = [B, L, D]
+        # value shape = [B, L, D]
+        attn_output, _ = self.attention(query=queries, key=key, value=value)
+        # attn_output shape = [B, N*P, D]
 
-        # Multi-head attention for all nodes in parallel
-        attn_output, _ = self.attention(
-            query=queries,      # [B*N, L_q, D]
-            key=expanded_key,   # [B*N, L, D]
-            value=expanded_value
-        )  # attn_output => [B*N, L_q, D]
+        # --- Residuals and FFN ---
+        # Add input corresponding to the query (pooled_x or queries before projection?)
+        # Let's add the final projected queries back for the residual
+        attn_output_proj = self.output_proj(attn_output)
+        attn_output_drop = self.dropout(attn_output_proj)
+        attn_res_output = self.output_norm(queries + attn_output_drop) # Residual Add
 
-        # Residual & normalization
-        attn_output = self.output_proj(attn_output)
-        attn_output = self.dropout(attn_output)
-        attn_output = self.output_norm(attn_output + queries)
+        ffn_output = self.ffn(attn_res_output)
+        ffn_res_output = self.ffn_norm(attn_res_output + ffn_output) # Residual Add for FFN
 
-        # Reshape back to [B, num_nodes, par_length, D]
-        output = attn_output.reshape(batch_size, self.num_nodes, self.par_length, dim)
+        # --- Reshape Output ---
+        # Final shape [B, N*P, D] -> [B, num_nodes, par_length, D]
+        output = ffn_res_output.view(batch_size, self.num_nodes, self.par_length, dim)
 
         return output
 
@@ -356,14 +360,21 @@ class FusionModule(nn.Module):
         embedding_dim: int,
         num_heads: int,
         dropout: float,
+        max_seq_len: int = 128,
     ):
         super(FusionModule, self).__init__()
 
         self.norm = nn.LayerNorm(embedding_dim)
 
+        self.pos_encoder = SinusoidalPositionalEncoding(embedding_dim)
+
         # Projections for K, V
-        self.key_proj = nn.Linear(embedding_dim, embedding_dim)
-        self.value_proj = nn.Linear(embedding_dim, embedding_dim)
+        self.key_proj = nn.Linear(embedding_dim, embedding_dim, bias=True)
+        self.value_proj = nn.Linear(embedding_dim, embedding_dim, bias=True)
+
+        self.target_seq_len = max_seq_len
+        self.query_pool = nn.AdaptiveAvgPool1d(self.target_seq_len)
+        self.pooled_to_query_proj = nn.Linear(embedding_dim, embedding_dim)
 
         # Attention mechanism
         self.attention = nn.MultiheadAttention(
@@ -374,9 +385,16 @@ class FusionModule(nn.Module):
         )
 
         # Output processing
-        self.output_proj = nn.Linear(embedding_dim, embedding_dim)
+        self.output_proj = nn.Linear(embedding_dim, embedding_dim, bias=True)
         self.output_norm = nn.LayerNorm(embedding_dim)
         self.dropout = nn.Dropout(dropout)
+
+        self.ffn = nn.Sequential(
+            nn.Linear(embedding_dim, 4 * embedding_dim, bias=True),
+            nn.ReLU(),
+            nn.Linear(4 * embedding_dim, embedding_dim, bias=True),
+        )
+        self.ffn_norm = nn.LayerNorm(embedding_dim)
 
     def forward(self, x: torch.Tensor, seq_len: int) -> torch.Tensor:
         """
@@ -400,15 +418,17 @@ class FusionModule(nn.Module):
         # Normalize
         x = self.norm(x)
 
+        # Add positional encoding
+        x = self.pos_encoder(x)
+
         # Project K, V
         key = self.key_proj(x)      # [B, N*node_seq_len, D]
         value = self.value_proj(x)
 
-        # Prepare query => [B, seq_len, D]
-        #   We'll produce the same number of tokens as seq_len (unless compressed later).
-        query = (build_1d_sin_encoding(seq_len, dim, device=x.device)
-                 .unsqueeze(0)
-                 .expand(batch_size, -1, -1))
+        # Prepare query
+        query_pooled = self.query_pool(x.permute(0, 2, 1))  # [B, D, target_seq_len]
+        query_pooled = query_pooled.permute(0, 2, 1)  # [B, target_seq_len, D]
+        query = self.pooled_to_query_proj(query_pooled)  # [B, target_seq_len, D]
 
         # Multi-head attention
         attn_output, _ = self.attention(
@@ -420,7 +440,11 @@ class FusionModule(nn.Module):
         # Output projection and residual
         output = self.output_proj(attn_output)
         output = self.dropout(output)
-        output = self.output_norm(output + query)  # Residual
+        ffn_input = self.output_norm(output)  # Residual
+        # => [B, seq_len, D]
+        # Apply feed-forward network
+        output = self.ffn(ffn_input)
+        output = self.ffn_norm(output + ffn_input)
 
         return output
 
@@ -505,6 +529,10 @@ class HAMABlock(nn.Module):
         """
         B, L, D = x.shape
 
+        # x = self.fission_module(x)  # => [B, num_nodes, par_length, D]
+        # fused = self.fusion_module(x, L)  # => [B, fused_len, D]
+        # return fused
+
         # 1) Fission
         node_repr = self.fission_module(x)  # => [B, num_nodes, par_length, D]
 
@@ -527,6 +555,10 @@ class HAMABlock(nn.Module):
         """
         B, L, D = x.shape
 
+        # x = self.fission_module(x)
+        # fused = self.fusion_module(x, L)
+        # return fused
+
         node_repr = self.fission_module(x)
         for i in range(self.num_nodes):
             node_repr[:, i] = self.autoencoders[i].encode(node_repr[:, i])
@@ -545,6 +577,10 @@ class HAMABlock(nn.Module):
             [B, fused_len, D]
         """
         B, L, D = x.shape
+
+        # x = self.fission_module(x)
+        # fused = self.fusion_module(x, L)
+        # return fused
 
         node_repr = self.fission_module(x)
         for i in range(self.num_nodes):
@@ -595,6 +631,7 @@ class HAMA(nn.Module):
         nodes_per_layer: List[int] = None,
         partition_lengths: List[int] = None,
         n_masks: List[int] = None,
+        activation: str = "relu",
     ):
         super(HAMA, self).__init__()
 
@@ -700,6 +737,28 @@ class HAMA(nn.Module):
             for i in range(num_layers)
         ])
 
+        # Activation function
+        if activation == "relu":
+            self.activation = nn.ReLU()
+        elif activation == "gelu":
+            self.activation = nn.GELU()
+        elif activation == "swish":
+            self.activation = nn.SiLU()
+        elif activation == "tanh":
+            self.activation = nn.Tanh()
+        elif activation == "sigmoid":
+            self.activation = nn.Sigmoid()
+        elif activation == "leaky_relu":
+            self.activation = nn.LeakyReLU()
+        elif activation == "elu":
+            self.activation = nn.ELU()
+        elif activation == "softmax":
+            self.activation = nn.Softmax(dim=-1)
+        elif activation == "identity":
+            self.activation = nn.Identity()
+        else:
+            raise ValueError(f"Unsupported activation function: {activation}")
+
     def forward(self, x: torch.Tensor):
         """
         Full forward: encode up each layer, then decode down.
@@ -710,9 +769,14 @@ class HAMA(nn.Module):
         for layer in self.layers:
             x = layer.encode(x)
 
+        x = self.activation(x)
+
         # Down (decode)
         for layer in reversed(self.layers):
             x = layer.decode(x)
+
+        # Final activation
+        x = self.activation(x)
 
         return x
 
@@ -720,12 +784,16 @@ class HAMA(nn.Module):
         """Encodes input through all HAMA layers."""
         for layer in self.layers:
             x = layer.encode(x)
+        # Final activation
+        x = self.activation(x)
         return x
 
     def decode(self, x: torch.Tensor):
         """Decodes input through all HAMA layers in reverse order."""
         for layer in reversed(self.layers):
             x = layer.decode(x)
+        # Final activation
+        x = self.activation(x)
         return x
 
 
