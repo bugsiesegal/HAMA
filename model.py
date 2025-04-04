@@ -243,210 +243,219 @@ class BabyAutoencoder(nn.Module):
 
 class FissionModule(nn.Module):
     """
-    Module that splits input sequence into multiple node-specific representations.
-
-    Uses learned queries and multi-head attention to create different views of the
-    input sequence for each node in the network.
+    Splits input sequence into multiple node-specific overlapping representations using unfold.
+    Calculates step size dynamically to distribute num_nodes patches across the sequence length.
 
     Args:
-        num_nodes (int): Number of output nodes
-        par_length (int): Length of each partition (query size)
-        embedding_dim (int): Dimension of embeddings
-        num_heads (int): Number of attention heads
-        dropout (float): Dropout rate
+        num_nodes (int): Number of output nodes/patches.
+        par_length (int): Length of each partition/patch.
+        embedding_dim (int): Dimension of embeddings.
     """
     def __init__(
         self,
         num_nodes: int,
         par_length: int,
         embedding_dim: int,
-        num_heads: int,
-        dropout: float
     ):
         super(FissionModule, self).__init__()
+        if num_nodes <= 0:
+            raise ValueError("num_nodes must be positive")
+        if par_length <= 0:
+             raise ValueError("par_length must be positive")
+
         self.num_nodes = num_nodes
         self.par_length = par_length
+        self.embedding_dim = embedding_dim
 
+        self.norm = nn.LayerNorm(embedding_dim)
+        # Optional: Add PE here or ensure it's added before passing to HAMA block
         self.pos_encoder = SinusoidalPositionalEncoding(embedding_dim)
 
-        # Layer normalization before attention
-        self.norm = nn.LayerNorm(embedding_dim)
 
-        # Projections for K, V
-        self.key_proj = nn.Linear(embedding_dim, embedding_dim, bias=True)
-        self.value_proj = nn.Linear(embedding_dim, embedding_dim, bias=True)
-
-        # Single multi-head attention layer
-        self.attention = nn.MultiheadAttention(
-            embed_dim=embedding_dim,
-            num_heads=num_heads,
-            dropout=dropout,
-            batch_first=True
-        )
-
-        # Output projection and normalization
-        self.output_proj = nn.Linear(embedding_dim, embedding_dim, bias=True)
-        self.output_norm = nn.LayerNorm(embedding_dim)
-        self.dropout = nn.Dropout(dropout)
-
-        self.ffn = nn.Sequential(
-            nn.Linear(embedding_dim, 4 * embedding_dim, bias=True),
-            nn.ReLU(),
-            nn.Linear(4 * embedding_dim, embedding_dim, bias=True),
-        )
-        self.ffn_norm = nn.LayerNorm(embedding_dim)
-
-        self.query_pool = nn.AdaptiveAvgPool1d(par_length * num_nodes)
-        self.pooled_query_proj = nn.Linear(embedding_dim, embedding_dim)
+    def calculate_step(self, seq_len: int) -> int:
+        """Calculates step size to spread num_nodes patches over seq_len."""
+        if self.num_nodes == 1:
+            # Only one patch needed, step doesn't really matter but should be >= 1
+            return 1
+        else:
+            # Calculate ideal step: step = (L - P) / (N - 1)
+            # Ensure seq_len > par_length for meaningful overlap calculation
+            if seq_len <= self.par_length:
+                # Sequence is too short for overlap with multiple nodes based on formula.
+                # Default to step=1, unfold will generate fewer patches than num_nodes.
+                # Or potentially raise an error if this case is invalid for the model logic.
+                # For now, let's use step=1. Fusion needs to handle this.
+                 return 1
+            else:
+                # Use max(1, ...) to prevent step=0 if L=P and N>1
+                step = max(1, int(math.floor((seq_len - self.par_length) / (self.num_nodes - 1))))
+                return step
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # Input shape: [B, L, D]
         batch_size, seq_len, dim = x.shape
 
+        # --- Preprocessing ---
         x_norm = self.norm(x)
-        x_pos = self.pos_encoder(x_norm) # Pos encoding after norm
+        x_processed = self.pos_encoder(x_norm) # Apply PE *after* norm? Or before? Check convention. Let's assume after.
 
-        key = self.key_proj(x_pos)
-        value = self.value_proj(x_pos)
+        # --- Calculate Dynamic Parameters ---
+        # Adjust par_length if sequence is too short
+        effective_par_length = min(seq_len, self.par_length)
+        if effective_par_length <= 0: # Handle empty sequence case
+             # Return empty tensor matching expected dims but with 0 nodes/patches? Or error?
+             # Returning tensor of shape [B, num_nodes, par_length, D] filled with zeros might be safest downstream.
+             print(f"Warning: Input seq_len is {seq_len}, cannot create patches. Returning zeros.")
+             return torch.zeros(batch_size, self.num_nodes, self.par_length, dim, device=x.device, dtype=x.dtype)
 
-        # --- Generate Queries from Input x ---
-        # 1. Pool the sequence dimension (L) to the target query length (N*P)
-        #    Input to pooling needs shape [B, D, L]
-        pooled_x = self.query_pool(x_pos.permute(0, 2, 1)) # Output shape [B, D, target_query_len]
 
-        # 2. Permute back and project
-        #    Shape back to [B, target_query_len, D]
-        pooled_x = pooled_x.permute(0, 2, 1)
-        queries = self.pooled_query_proj(pooled_x) # Shape [B, target_query_len, D]
+        step = self.calculate_step(seq_len)
 
-        # --- Attention ---
-        # query shape = [B, N*P, D]
-        # key shape = [B, L, D]
-        # value shape = [B, L, D]
-        attn_output, _ = self.attention(query=queries, key=key, value=value)
-        # attn_output shape = [B, N*P, D]
+        # --- Unfold ---
+        # unfold needs contiguous tensor
+        patches = x_processed.contiguous().unfold(dimension=1, size=effective_par_length, step=step)
+        # Output shape: [B, num_generated_patches, D, effective_par_length]
 
-        # --- Residuals and FFN ---
-        # Add input corresponding to the query (pooled_x or queries before projection?)
-        # Let's add the final projected queries back for the residual
-        attn_output_proj = self.output_proj(attn_output)
-        attn_output_drop = self.dropout(attn_output_proj)
-        attn_res_output = self.output_norm(queries + attn_output_drop) # Residual Add
+        num_generated_patches = patches.shape[1]
 
-        ffn_output = self.ffn(attn_res_output)
-        ffn_res_output = self.ffn_norm(attn_res_output + ffn_output) # Residual Add for FFN
+        # Permute D to the end: [B, num_generated_patches, effective_par_length, D]
+        patches = patches.permute(0, 1, 3, 2)
 
-        # --- Reshape Output ---
-        # Final shape [B, N*P, D] -> [B, num_nodes, par_length, D]
-        output = ffn_res_output.view(batch_size, self.num_nodes, self.par_length, dim)
+        # --- Adjust Number of Patches to Match num_nodes ---
+        output_tensor = torch.zeros(batch_size, self.num_nodes, self.par_length, dim,
+                                     dtype=patches.dtype, device=patches.device)
 
-        return output
+        if num_generated_patches == 0 and self.num_nodes > 0:
+             # Should be caught by effective_par_length check, but as safeguard
+             print(f"Warning: unfold generated 0 patches for seq_len {seq_len}, size {effective_par_length}, step {step}.")
+             return output_tensor # Return zeros
+
+        # Copy generated patches, truncating or padding as needed
+        num_to_copy = min(num_generated_patches, self.num_nodes)
+        len_to_copy = min(effective_par_length, self.par_length) # Should usually be par_length unless L was short
+
+        output_tensor[:, :num_to_copy, :len_to_copy, :] = patches[:, :num_to_copy, :len_to_copy, :]
+
+        # output_tensor shape: [B, num_nodes, par_length, D]
+        # Note: If num_generated_patches < num_nodes, trailing nodes will be zeros.
+        # Note: If L < par_length, trailing sequence dim will be zeros.
+        return output_tensor
 
 
 class FusionModule(nn.Module):
     """
-    Fuses multiple node-specific representations back into a single sequence
-    via a learned query + attention. Optionally compresses the fused sequence
-    with chunk-based average pooling (if compression_factor > 1).
+    Fuses multiple overlapping node-specific representations back into
+    a single sequence using overlap-add logic.
 
     Args:
-        embedding_dim (int): Dimension of embeddings
-        num_heads (int): Number of attention heads
-        dropout (float): Dropout rate
-        compression_factor (int): Factor by which to downsample the final sequence
-            (1 = no compression, 2 or more => chunk-based average pooling)
+        num_nodes (int): Number of input nodes/patches.
+        par_length (int): Length of each input partition/patch.
+        embedding_dim (int): Dimension of embeddings.
     """
     def __init__(
         self,
+        num_nodes: int, # Need num_nodes and par_length to recalculate step
+        par_length: int,
         embedding_dim: int,
-        num_heads: int,
-        dropout: float,
-        max_seq_len: int = 128,
     ):
         super(FusionModule, self).__init__()
+        self.num_nodes = num_nodes
+        self.par_length = par_length
+        self.embedding_dim = embedding_dim # Store if needed
 
         self.norm = nn.LayerNorm(embedding_dim)
+        # No PE needed here - applied before Fission
 
-        self.pos_encoder = SinusoidalPositionalEncoding(embedding_dim)
-
-        # Projections for K, V
-        self.key_proj = nn.Linear(embedding_dim, embedding_dim, bias=True)
-        self.value_proj = nn.Linear(embedding_dim, embedding_dim, bias=True)
-
-        self.target_seq_len = max_seq_len
-        self.query_pool = nn.AdaptiveAvgPool1d(self.target_seq_len)
-        self.pooled_to_query_proj = nn.Linear(embedding_dim, embedding_dim)
-
-        # Attention mechanism
-        self.attention = nn.MultiheadAttention(
-            embed_dim=embedding_dim,
-            num_heads=num_heads,
-            dropout=dropout,
-            batch_first=True
-        )
-
-        # Output processing
-        self.output_proj = nn.Linear(embedding_dim, embedding_dim, bias=True)
-        self.output_norm = nn.LayerNorm(embedding_dim)
-        self.dropout = nn.Dropout(dropout)
-
-        self.ffn = nn.Sequential(
-            nn.Linear(embedding_dim, 4 * embedding_dim, bias=True),
-            nn.ReLU(),
-            nn.Linear(4 * embedding_dim, embedding_dim, bias=True),
-        )
-        self.ffn_norm = nn.LayerNorm(embedding_dim)
+    def calculate_step(self, seq_len: int) -> int:
+        """Recalculates step size used by Fission."""
+        # This MUST match the logic in FissionModule!
+        if self.num_nodes == 1:
+            return 1
+        else:
+            if seq_len <= self.par_length:
+                 return 1
+            else:
+                step = max(1, int(math.floor((seq_len - self.par_length) / (self.num_nodes - 1))))
+                return step
 
     def forward(self, x: torch.Tensor, seq_len: int) -> torch.Tensor:
         """
-        Combines multiple node representations into a single sequence.
-        Optionally compresses final output if self.compression_factor > 1.
+        Combines overlapping node representations using overlap-add.
 
         Args:
-            x (torch.Tensor): [batch_size, num_nodes, node_seq_len, embedding_dim]
-            seq_len (int): Desired output sequence length *before* optional compression.
+            x (torch.Tensor): Output from BabyAEs [B, num_nodes, par_length, D]
+            seq_len (int): Original input sequence length (L)
 
         Returns:
-            fused (torch.Tensor): [batch_size, fused_len, embedding_dim]
-              Where fused_len = seq_len if compression_factor=1,
-              or fused_len ~ seq_len // compression_factor otherwise.
+            fused (torch.Tensor): [B, L, D]
         """
-        batch_size, num_nodes, node_seq_len, dim = x.shape
+        batch_size, num_nodes_in, node_seq_len, dim = x.shape
+        output_len = seq_len # L
 
-        # Flatten node dimension into the time dimension
-        x = x.view(batch_size, num_nodes * node_seq_len, dim)
+        if num_nodes_in != self.num_nodes:
+             raise ValueError(f"Input num_nodes ({num_nodes_in}) does not match module's num_nodes ({self.num_nodes})")
+        if node_seq_len != self.par_length:
+             raise ValueError(f"Input node_seq_len ({node_seq_len}) does not match module's par_length ({self.par_length})")
 
-        # Normalize
-        x = self.norm(x)
+        # If original sequence was empty or too short
+        if output_len == 0:
+             return torch.zeros(batch_size, 0, dim, dtype=x.dtype, device=x.device)
 
-        # Add positional encoding
-        x = self.pos_encoder(x)
+        step = self.calculate_step(output_len)
 
-        # Project K, V
-        key = self.key_proj(x)      # [B, N*node_seq_len, D]
-        value = self.value_proj(x)
+        output = torch.zeros(batch_size, output_len, dim, dtype=x.dtype, device=x.device)
+        counts = torch.zeros(batch_size, output_len, 1, dtype=x.dtype, device=x.device)
 
-        # Prepare query
-        query_pooled = self.query_pool(x.permute(0, 2, 1))  # [B, D, target_seq_len]
-        query_pooled = query_pooled.permute(0, 2, 1)  # [B, target_seq_len, D]
-        query = self.pooled_to_query_proj(query_pooled)  # [B, target_seq_len, D]
+        effective_par_length = min(output_len, self.par_length) # Max length of any real chunk
 
-        # Multi-head attention
-        attn_output, _ = self.attention(
-            query=query,    # [B, seq_len, D]
-            key=key,        # [B, N*node_seq_len, D]
-            value=value
-        )  # => [B, seq_len, D]
+        for i in range(self.num_nodes):
+            start_idx = i * step
+            end_idx = start_idx + self.par_length # Use full par_length for potential window size
 
-        # Output projection and residual
-        output = self.output_proj(attn_output)
-        output = self.dropout(output)
-        ffn_input = self.output_norm(output)  # Residual
-        # => [B, seq_len, D]
-        # Apply feed-forward network
-        output = self.ffn(ffn_input)
-        output = self.ffn_norm(output + ffn_input)
+            # Clamp indices to the actual output sequence length
+            actual_start_idx = min(start_idx, output_len)
+            actual_end_idx = min(end_idx, output_len)
 
-        return output
+            # Calculate the length of the chunk to actually use from input x
+            # and the slice in the output tensor
+            length_in_output = actual_end_idx - actual_start_idx
+            if length_in_output <= 0:
+                continue # This chunk starts beyond the output length
+
+            # The corresponding length in the input chunk x might be shorter
+            # if the original sequence L was shorter than par_length,
+            # or if this patch goes past L.
+            length_from_input = min(length_in_output, effective_par_length)
+
+            # Get the relevant part of the processed chunk from BabyAE 'i'
+            # We only take up to length_from_input from the potentially zero-padded input x
+            chunk_to_add = x[:, i, :length_from_input, :]
+
+            if chunk_to_add.shape[1] != length_in_output:
+                 # This case can happen if start_idx > 0 and end_idx > output_len
+                 # We need to take the correct slice of chunk_to_add
+                 if start_idx < output_len:
+                     chunk_to_add = chunk_to_add[:, :(output_len - start_idx) , :]
+                     length_in_output = chunk_to_add.shape[1] # Adjust length
+                     if length_in_output <= 0: continue
+                 else:
+                     continue # Start index is already out of bounds
+
+
+            # Add contributions using slicing for broadcasting
+            output[:, actual_start_idx:actual_end_idx, :] += chunk_to_add
+            counts[:, actual_start_idx:actual_end_idx, :] += 1.0
+
+        # Avoid division by zero for areas with potentially no contribution
+        # (e.g., if L is very short or step logic leads to gaps)
+        counts = torch.clamp(counts, min=1e-8) # Use epsilon instead of 1.0 to avoid changing scale
+
+        fused = output / counts
+
+        # Optional final normalization
+        fused = self.norm(fused)
+
+        return fused
 
 
 class HAMABlock(nn.Module):
@@ -506,15 +515,13 @@ class HAMABlock(nn.Module):
             num_nodes=num_nodes,
             par_length=partition_length,
             embedding_dim=embedding_dim,
-            num_heads=num_heads,
-            dropout=dropout
         )
 
         # Fusion => combine node streams, optionally compress
         self.fusion_module = FusionModule(
             embedding_dim=embedding_dim,
-            num_heads=num_heads,
-            dropout=dropout,
+            num_nodes=num_nodes,
+            par_length=partition_length,
         )
 
     def forward(self, x: torch.Tensor):

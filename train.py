@@ -4,6 +4,7 @@ from typing import Optional, Dict, Any, Tuple, List, Union
 import torch
 import torch.nn as nn
 import torch.optim as optim
+import wandb
 from torch.utils.data import DataLoader, Dataset, random_split
 import pytorch_lightning as pl
 from pytorch_lightning.callbacks import ModelCheckpoint, EarlyStopping, LearningRateMonitor
@@ -30,7 +31,8 @@ class HAMALightningModule(pl.LightningModule):
             layerwise_epochs: int = 10,
             weight_decay: float = 0.01,
             layerwise_pretraining: bool = True,
-            criterion: Optional[nn.Module] = None
+            criterion: Optional[nn.Module] = None,
+            tokenizer: Optional[Any] = None
     ):
         super().__init__()
         self.model = model
@@ -39,6 +41,7 @@ class HAMALightningModule(pl.LightningModule):
         self.layerwise_epochs = layerwise_epochs
         self.weight_decay = weight_decay
         self.layerwise_pretraining = layerwise_pretraining
+        self.tokenizer = tokenizer
 
         # Default criterion if none provided
         if criterion is None:
@@ -163,6 +166,24 @@ class HAMALightningModule(pl.LightningModule):
         else:
             loss = self.criterion(output, input_tensor)
 
+        if self.logger.experiment and batch_idx == 0:
+            # Log output for the first batch
+            if self.is_text_task:
+                # For text tasks, log the output as well in the form of text
+                columns = ['Input Text', 'Reconstructed Text']
+                input_text = self.tokenizer.decode(input_tensor[0].cpu())
+                output_text = self.tokenizer.decode(torch.argmax(output.cpu(), dim=-1)[0])
+                table = wandb.Table(columns=columns, data=[[input_text, output_text]])
+                self.logger.experiment.log({
+                    'val_output': table
+                }, commit=False)
+                print(f"Input: {input_text}")
+                print(f"Output: {output_text}")
+            else:
+                self.logger.experiment.log({
+                    'val_output': output[0].cpu().numpy()
+                })
+
         self.log('val_loss', loss, prog_bar=True, sync_dist=True)
         return loss
 
@@ -279,6 +300,24 @@ class HAMALightningModule(pl.LightningModule):
 
             # Forward pass through current layer
             output = self.model.layers[self.current_layer_idx](y)
+
+        if self.logger.experiment and batch_idx == 0:
+            # Log output for the first batch
+            if self.is_text_task:
+                # For text tasks, log the output as well in the form of text
+                columns = ['Input Text', 'Reconstructed Text']
+                input_text = self.tokenizer.decode(x[0].cpu())
+                output_text = self.tokenizer.decode(torch.argmax(output.cpu(), dim=-1)[0])
+                table = wandb.Table(columns=columns, data=[[input_text, output_text]])
+                self.logger.experiment.log({
+                    f'layer_{self.current_layer_idx}_val_output': table
+                }, commit=False)
+                print(f"Input: {input_text}")
+                print(f"Output: {output_text}")
+            else:
+                self.logger.experiment.log({
+                    f'layer_{self.current_layer_idx}_val_output': output[0].cpu().numpy()
+                })
 
         # Compute loss
         if self.is_text_task:
