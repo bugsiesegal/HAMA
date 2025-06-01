@@ -5,6 +5,8 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from routing import CrossAttentionRouter, CrossAttentionGather
+
 
 class SinusoidalPositionalEncoding(nn.Module):
     """
@@ -58,69 +60,6 @@ class SinusoidalPositionalEncoding(nn.Module):
         pos_encoding = self._get_positional_encoding(seq_len, x.device)
         return x + pos_encoding.unsqueeze(0)
 
-def build_1d_sin_encoding(seq_len, d_model, device):
-    """
-    Dynamically builds a 1D sinusoidal position encoding of shape [seq_len, d_model].
-    """
-    if d_model % 2 != 0:
-        raise ValueError("d_model should be even.")
-
-    div_term = torch.exp(
-        torch.arange(0, d_model, 2, device=device).float() * (-math.log(10000.0) / d_model)
-    )
-
-    # [seq_len, d_model]
-    position = torch.arange(seq_len, device=device).float().unsqueeze(1)
-    pe = torch.zeros(seq_len, d_model, device=device)
-    pe[:, 0::2] = torch.sin(position * div_term)
-    pe[:, 1::2] = torch.cos(position * div_term)
-    return pe
-
-def build_2d_sin_encoding(H, W, d_model, device):
-    """
-    Dynamically builds a 2D sinusoidal position encoding of shape [H, W, d_model].
-    Splits d_model in half for rows, half for columns, then merges them.
-    """
-    if d_model % 2 != 0:
-        raise ValueError("d_model should be even.")
-
-    d_h = d_model // 2
-    d_w = d_model // 2
-
-    row_positions = torch.arange(H, device=device).unsqueeze(1)  # [H,1]
-    col_positions = torch.arange(W, device=device).unsqueeze(1)  # [W,1]
-
-    # Frequencies
-    div_term_h = torch.exp(
-        torch.arange(0, d_h, 2, device=device).float() * (-math.log(10000.0) / d_h)
-    )
-    div_term_w = torch.exp(
-        torch.arange(0, d_w, 2, device=device).float() * (-math.log(10000.0) / d_w)
-    )
-
-    # [H, d_h]
-    row_enc = torch.zeros(H, d_h, device=device)
-    row_enc[:, 0::2] = torch.sin(row_positions * div_term_h)
-    row_enc[:, 1::2] = torch.cos(row_positions * div_term_h)
-
-    # [W, d_w]
-    col_enc = torch.zeros(W, d_w, device=device)
-    col_enc[:, 0::2] = torch.sin(col_positions * div_term_w)
-    col_enc[:, 1::2] = torch.cos(col_positions * div_term_w)
-
-    # Expand to [H, W, d_model]
-    # First half is row, second half is col
-    # row_enc => [H, d_h], col_enc => [W, d_w]
-    # We'll broadcast row_enc along W, col_enc along H
-    row_enc = row_enc.unsqueeze(1)  # [H,1,d_h]
-    col_enc = col_enc.unsqueeze(0)  # [1,W,d_w]
-
-    # final: [H, W, d_model]
-    pe = torch.zeros(H, W, d_model, device=device)
-    pe[:, :, :d_h] = row_enc  # broadcast along width dimension
-    pe[:, :, d_h:] = col_enc  # broadcast along height dimension
-    return pe
-
 class BabyAutoencoder(nn.Module):
     """
     A simple transformer-based autoencoder with optional token masking.
@@ -148,8 +87,8 @@ class BabyAutoencoder(nn.Module):
         super(BabyAutoencoder, self).__init__()
 
         self.pos_encoder = SinusoidalPositionalEncoding(d_model)
-        self.encoder = nn.TransformerEncoder(
-            nn.TransformerEncoderLayer(
+        self.encoder = nn.TransformerDecoder(
+            nn.TransformerDecoderLayer(
                 d_model=d_model,
                 nhead=nhead,
                 batch_first=True
@@ -157,8 +96,8 @@ class BabyAutoencoder(nn.Module):
             num_layers=num_layers,
             norm=norm
         )
-        self.decoder = nn.TransformerEncoder(
-            nn.TransformerEncoderLayer(
+        self.decoder = nn.TransformerDecoder(
+            nn.TransformerDecoderLayer(
                 d_model=d_model,
                 nhead=nhead,
                 batch_first=True
@@ -172,6 +111,8 @@ class BabyAutoencoder(nn.Module):
 
         self.activation = nn.Identity()
 
+        self.masking_token = nn.Parameter(torch.randn(1, n_mask, d_model), requires_grad=True) if use_masking else None
+
     def forward(self, x: torch.Tensor):
         """
         Performs full autoencoding cycle (encode + decode).
@@ -184,23 +125,14 @@ class BabyAutoencoder(nn.Module):
         """
         # --- Encoding ---
         x = self.pos_encoder(x)
-        x = self.encoder(x)
+        x = self.encoder(x, x)  # Transformer decoder expects two inputs
         x = self.activation(x)
 
         if self.use_masking and self.n_mask > 0:
-            # shape: [B, L]
-            scores = x.norm(dim=2)  # or x.mean(dim=2), etc.
-
-            # topk along dimension=1 (the length dimension)
-            _, token_indices = torch.topk(scores, self.n_mask, dim=1, largest=False)  # shape [B, n_mask]
-
-            mask = torch.zeros(x.shape[:2], dtype=torch.int, device=x.device)
-            mask.scatter_(1, token_indices, 1)
-            mask = mask.unsqueeze(-1).to(x.dtype)
-            x = x.masked_fill(mask.bool(), 0.0)
+            x[:, :self.n_mask, :] = self.masking_token
 
         # --- Decoding ---
-        x = self.decoder(x)
+        x = self.decoder(x, x)
 
         return x
 
@@ -215,16 +147,11 @@ class BabyAutoencoder(nn.Module):
             torch.Tensor: Encoded representation
         """
         x = self.pos_encoder(x)
-        x = self.encoder(x)
+        x = self.encoder(x, x)
         x = self.activation(x)
 
         if self.use_masking and self.n_mask > 0:
-            scores = x.norm(dim=2)
-            _, token_indices = torch.topk(scores, self.n_mask, dim=1, largest=False)
-            mask = torch.zeros(x.shape[:2], dtype=torch.int, device=x.device)
-            mask.scatter_(1, token_indices, 1)
-            mask = mask.unsqueeze(-1).to(x.dtype)
-            x = x.masked_fill(mask.bool(), 0.0)
+            x[:, :self.n_mask, :] = self.masking_token
 
         return x
 
@@ -238,224 +165,7 @@ class BabyAutoencoder(nn.Module):
         Returns:
             torch.Tensor: Decoded output
         """
-        return self.decoder(x)
-
-
-class FissionModule(nn.Module):
-    """
-    Splits input sequence into multiple node-specific overlapping representations using unfold.
-    Calculates step size dynamically to distribute num_nodes patches across the sequence length.
-
-    Args:
-        num_nodes (int): Number of output nodes/patches.
-        par_length (int): Length of each partition/patch.
-        embedding_dim (int): Dimension of embeddings.
-    """
-    def __init__(
-        self,
-        num_nodes: int,
-        par_length: int,
-        embedding_dim: int,
-    ):
-        super(FissionModule, self).__init__()
-        if num_nodes <= 0:
-            raise ValueError("num_nodes must be positive")
-        if par_length <= 0:
-             raise ValueError("par_length must be positive")
-
-        self.num_nodes = num_nodes
-        self.par_length = par_length
-        self.embedding_dim = embedding_dim
-
-        self.norm = nn.LayerNorm(embedding_dim)
-        # Optional: Add PE here or ensure it's added before passing to HAMA block
-        self.pos_encoder = SinusoidalPositionalEncoding(embedding_dim)
-
-
-    def calculate_step(self, seq_len: int) -> int:
-        """Calculates step size to spread num_nodes patches over seq_len."""
-        if self.num_nodes == 1:
-            # Only one patch needed, step doesn't really matter but should be >= 1
-            return 1
-        else:
-            # Calculate ideal step: step = (L - P) / (N - 1)
-            # Ensure seq_len > par_length for meaningful overlap calculation
-            if seq_len <= self.par_length:
-                # Sequence is too short for overlap with multiple nodes based on formula.
-                # Default to step=1, unfold will generate fewer patches than num_nodes.
-                # Or potentially raise an error if this case is invalid for the model logic.
-                # For now, let's use step=1. Fusion needs to handle this.
-                 return 1
-            else:
-                # Use max(1, ...) to prevent step=0 if L=P and N>1
-                step = max(1, int(math.floor((seq_len - self.par_length) / (self.num_nodes - 1))))
-                return step
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # Input shape: [B, L, D]
-        batch_size, seq_len, dim = x.shape
-
-        # --- Preprocessing ---
-        x_norm = self.norm(x)
-        x_processed = self.pos_encoder(x_norm) # Apply PE *after* norm? Or before? Check convention. Let's assume after.
-
-        # --- Calculate Dynamic Parameters ---
-        # Adjust par_length if sequence is too short
-        effective_par_length = min(seq_len, self.par_length)
-        if effective_par_length <= 0: # Handle empty sequence case
-             # Return empty tensor matching expected dims but with 0 nodes/patches? Or error?
-             # Returning tensor of shape [B, num_nodes, par_length, D] filled with zeros might be safest downstream.
-             print(f"Warning: Input seq_len is {seq_len}, cannot create patches. Returning zeros.")
-             return torch.zeros(batch_size, self.num_nodes, self.par_length, dim, device=x.device, dtype=x.dtype)
-
-
-        step = self.calculate_step(seq_len)
-
-        # --- Unfold ---
-        # unfold needs contiguous tensor
-        patches = x_processed.contiguous().unfold(dimension=1, size=effective_par_length, step=step)
-        # Output shape: [B, num_generated_patches, D, effective_par_length]
-
-        num_generated_patches = patches.shape[1]
-
-        # Permute D to the end: [B, num_generated_patches, effective_par_length, D]
-        patches = patches.permute(0, 1, 3, 2)
-
-        # --- Adjust Number of Patches to Match num_nodes ---
-        output_tensor = torch.zeros(batch_size, self.num_nodes, self.par_length, dim,
-                                     dtype=patches.dtype, device=patches.device)
-
-        if num_generated_patches == 0 and self.num_nodes > 0:
-             # Should be caught by effective_par_length check, but as safeguard
-             print(f"Warning: unfold generated 0 patches for seq_len {seq_len}, size {effective_par_length}, step {step}.")
-             return output_tensor # Return zeros
-
-        # Copy generated patches, truncating or padding as needed
-        num_to_copy = min(num_generated_patches, self.num_nodes)
-        len_to_copy = min(effective_par_length, self.par_length) # Should usually be par_length unless L was short
-
-        output_tensor[:, :num_to_copy, :len_to_copy, :] = patches[:, :num_to_copy, :len_to_copy, :]
-
-        # output_tensor shape: [B, num_nodes, par_length, D]
-        # Note: If num_generated_patches < num_nodes, trailing nodes will be zeros.
-        # Note: If L < par_length, trailing sequence dim will be zeros.
-        return output_tensor
-
-
-class FusionModule(nn.Module):
-    """
-    Fuses multiple overlapping node-specific representations back into
-    a single sequence using overlap-add logic.
-
-    Args:
-        num_nodes (int): Number of input nodes/patches.
-        par_length (int): Length of each input partition/patch.
-        embedding_dim (int): Dimension of embeddings.
-    """
-    def __init__(
-        self,
-        num_nodes: int, # Need num_nodes and par_length to recalculate step
-        par_length: int,
-        embedding_dim: int,
-    ):
-        super(FusionModule, self).__init__()
-        self.num_nodes = num_nodes
-        self.par_length = par_length
-        self.embedding_dim = embedding_dim # Store if needed
-
-        self.norm = nn.LayerNorm(embedding_dim)
-        # No PE needed here - applied before Fission
-
-    def calculate_step(self, seq_len: int) -> int:
-        """Recalculates step size used by Fission."""
-        # This MUST match the logic in FissionModule!
-        if self.num_nodes == 1:
-            return 1
-        else:
-            if seq_len <= self.par_length:
-                 return 1
-            else:
-                step = max(1, int(math.floor((seq_len - self.par_length) / (self.num_nodes - 1))))
-                return step
-
-    def forward(self, x: torch.Tensor, seq_len: int) -> torch.Tensor:
-        """
-        Combines overlapping node representations using overlap-add.
-
-        Args:
-            x (torch.Tensor): Output from BabyAEs [B, num_nodes, par_length, D]
-            seq_len (int): Original input sequence length (L)
-
-        Returns:
-            fused (torch.Tensor): [B, L, D]
-        """
-        batch_size, num_nodes_in, node_seq_len, dim = x.shape
-        output_len = seq_len # L
-
-        if num_nodes_in != self.num_nodes:
-             raise ValueError(f"Input num_nodes ({num_nodes_in}) does not match module's num_nodes ({self.num_nodes})")
-        if node_seq_len != self.par_length:
-             raise ValueError(f"Input node_seq_len ({node_seq_len}) does not match module's par_length ({self.par_length})")
-
-        # If original sequence was empty or too short
-        if output_len == 0:
-             return torch.zeros(batch_size, 0, dim, dtype=x.dtype, device=x.device)
-
-        step = self.calculate_step(output_len)
-
-        output = torch.zeros(batch_size, output_len, dim, dtype=x.dtype, device=x.device)
-        counts = torch.zeros(batch_size, output_len, 1, dtype=x.dtype, device=x.device)
-
-        effective_par_length = min(output_len, self.par_length) # Max length of any real chunk
-
-        for i in range(self.num_nodes):
-            start_idx = i * step
-            end_idx = start_idx + self.par_length # Use full par_length for potential window size
-
-            # Clamp indices to the actual output sequence length
-            actual_start_idx = min(start_idx, output_len)
-            actual_end_idx = min(end_idx, output_len)
-
-            # Calculate the length of the chunk to actually use from input x
-            # and the slice in the output tensor
-            length_in_output = actual_end_idx - actual_start_idx
-            if length_in_output <= 0:
-                continue # This chunk starts beyond the output length
-
-            # The corresponding length in the input chunk x might be shorter
-            # if the original sequence L was shorter than par_length,
-            # or if this patch goes past L.
-            length_from_input = min(length_in_output, effective_par_length)
-
-            # Get the relevant part of the processed chunk from BabyAE 'i'
-            # We only take up to length_from_input from the potentially zero-padded input x
-            chunk_to_add = x[:, i, :length_from_input, :]
-
-            if chunk_to_add.shape[1] != length_in_output:
-                 # This case can happen if start_idx > 0 and end_idx > output_len
-                 # We need to take the correct slice of chunk_to_add
-                 if start_idx < output_len:
-                     chunk_to_add = chunk_to_add[:, :(output_len - start_idx) , :]
-                     length_in_output = chunk_to_add.shape[1] # Adjust length
-                     if length_in_output <= 0: continue
-                 else:
-                     continue # Start index is already out of bounds
-
-
-            # Add contributions using slicing for broadcasting
-            output[:, actual_start_idx:actual_end_idx, :] += chunk_to_add
-            counts[:, actual_start_idx:actual_end_idx, :] += 1.0
-
-        # Avoid division by zero for areas with potentially no contribution
-        # (e.g., if L is very short or step logic leads to gaps)
-        counts = torch.clamp(counts, min=1e-8) # Use epsilon instead of 1.0 to avoid changing scale
-
-        fused = output / counts
-
-        # Optional final normalization
-        fused = self.norm(fused)
-
-        return fused
+        return self.decoder(x, x)
 
 
 class HAMABlock(nn.Module):
@@ -479,25 +189,25 @@ class HAMABlock(nn.Module):
         compression_factor (int): Factor to compress the fused output
         norm (nn.Module, optional): Normalization layer
     """
-    def __init__(
-        self,
-        num_nodes: int,
-        partition_length: int,
-        embedding_dim: int,
-        num_heads: int,
-        dropout: float,
-        num_layers: int,
-        n_mask: int,
-        use_masking: bool = True,
-        compression_factor: int = 1,
-        norm: nn.Module = None
-    ):
-        super(HAMABlock, self).__init__()
-        self.n_mask = n_mask
-        self.num_nodes = num_nodes
-        self.compression_factor = compression_factor
+    def __init__(self, *, num_nodes, partition_length, embedding_dim,
+                 num_heads, dropout, num_layers, n_mask, use_masking,
+                 compression_factor, norm):
+        super().__init__()
 
-        # Parallel baby autoencoders
+        self.router = CrossAttentionRouter(
+            num_nodes=num_nodes,
+            partition_length=partition_length,
+            embedding_dim=embedding_dim,
+            num_heads=num_heads,
+            dropout=dropout,
+        )
+        self.gather = CrossAttentionGather(
+            embedding_dim=embedding_dim,
+            num_heads=num_heads,
+            dropout=dropout,
+        )
+
+        # Baby AEs stay unchanged
         self.autoencoders = nn.ModuleList([
             BabyAutoencoder(
                 d_model=embedding_dim,
@@ -505,96 +215,58 @@ class HAMABlock(nn.Module):
                 num_layers=num_layers,
                 n_mask=n_mask,
                 use_masking=use_masking,
-                norm=norm
+                norm=norm,
             )
             for _ in range(num_nodes)
         ])
 
-        # Fission => produce multiple node-specific streams
-        self.fission_module = FissionModule(
-            num_nodes=num_nodes,
-            par_length=partition_length,
-            embedding_dim=embedding_dim,
-        )
-
-        # Fusion => combine node streams, optionally compress
-        self.fusion_module = FusionModule(
-            embedding_dim=embedding_dim,
-            num_nodes=num_nodes,
-            par_length=partition_length,
-        )
-
-    def forward(self, x: torch.Tensor):
-        """
-        Performs complete block processing (encode + decode).
-
-        Args:
-            x (torch.Tensor): [batch_size, seq_len, embedding_dim]
-
-        Returns:
-            [batch_size, fused_len, embedding_dim]
-        """
-        B, L, D = x.shape
-
-        # x = self.fission_module(x)  # => [B, num_nodes, par_length, D]
-        # fused = self.fusion_module(x, L)  # => [B, fused_len, D]
-        # return fused
-
-        # 1) Fission
-        node_repr = self.fission_module(x)  # => [B, num_nodes, par_length, D]
-
-        # 2) Parallel autoencoders
-        for i in range(self.num_nodes):
+    # ------------------------------------------------------------------
+    def _run_nodes(self, node_repr: torch.Tensor) -> torch.Tensor:
+        # node_repr: [B, N, P, D]
+        B, N, P, D = node_repr.shape
+        for i in range(N):
             node_repr[:, i] = self.autoencoders[i](node_repr[:, i])
+        return node_repr
 
-        # 3) Fusion
-        fused = self.fusion_module(node_repr, L)  # => [B, fused_len, D]
-        return fused
-
+    # ------------------------------------------------------------------
     def encode(self, x: torch.Tensor):
-        """
-        Encodes input (through fission + parallel AE encodes) => fuse => compress if chosen.
+        node_repr, _ = self.router(x)
+        node_repr = self._run_nodes(node_repr)
+        fused = self.gather(node_repr, seq_len=x.size(1))
 
-        Args:
-            x: [B, L, D]
-        Returns:
-            [B, fused_len, D]
-        """
-        B, L, D = x.shape
-
-        # x = self.fission_module(x)
-        # fused = self.fusion_module(x, L)
-        # return fused
-
-        node_repr = self.fission_module(x)
-        for i in range(self.num_nodes):
-            node_repr[:, i] = self.autoencoders[i].encode(node_repr[:, i])
-
-        # During encoding, we might produce fewer tokens if compression_factor > 1
-        fused = self.fusion_module(node_repr, int((L - self.n_mask*self.num_nodes) / self.compression_factor))
+        if self.compression_factor > 1:
+            fused = fused[:, :: self.compression_factor, :]
         return fused
 
+    # ------------------------------------------------------------------
     def decode(self, x: torch.Tensor):
-        """
-        Decodes representation (fission + parallel AE decode) => fuse => compress if chosen.
+        # up‑sample if compression was applied
+        if self.compression_factor > 1:
+            x = torch.repeat_interleave(x, repeats=self.compression_factor, dim=1)
 
-        Args:
-            x: [B, L, D]
-        Returns:
-            [B, fused_len, D]
-        """
-        B, L, D = x.shape
-
-        # x = self.fission_module(x)
-        # fused = self.fusion_module(x, L)
-        # return fused
-
-        node_repr = self.fission_module(x)
+        node_repr, _ = self.router(x)
         for i in range(self.num_nodes):
             node_repr[:, i] = self.autoencoders[i].decode(node_repr[:, i])
-
-        fused = self.fusion_module(node_repr, int((L + self.n_mask * self.num_nodes) * self.compression_factor))
+        fused = self.gather(node_repr, seq_len=x.size(1))
         return fused
+
+    # --------------------------------------------------------
+    def forward(self, x: torch.Tensor):
+        """
+        Full forward pass: encode and decode the input.
+
+        Args:
+            x (torch.Tensor): Input tensor [batch_size, seq_len, embedding_dim]
+        Returns:
+            torch.Tensor: Reconstructed output
+        """
+        # Encoding
+        x = self.encode(x)
+
+        # Decoding
+        x = self.decode(x)
+
+        return x
 
 
 class HAMA(nn.Module):
@@ -606,6 +278,7 @@ class HAMA(nn.Module):
       - optionally compress the fused representation in the fusion step.
 
     Args:
+        input_dim (int): Dimension of input features
         embedding_dim (int): Dimension of embeddings used throughout the model
         num_heads (int): Number of attention heads in transformer layers
         dropout (float): Dropout rate for regularization
@@ -621,6 +294,7 @@ class HAMA(nn.Module):
     """
     def __init__(
         self,
+        input_dim: int,
         embedding_dim: int,
         num_heads: int,
         dropout: float,
@@ -726,6 +400,7 @@ class HAMA(nn.Module):
         self.n_masks = n_masks
         self.use_masking = use_masking
         self.compression_factor = compression_factor
+        self.input_dim = input_dim
 
         # Create HAMA blocks
         self.layers = nn.ModuleList([
@@ -743,6 +418,11 @@ class HAMA(nn.Module):
             )
             for i in range(num_layers)
         ])
+
+        # Input projection layer
+        self.input_projection = nn.Linear(input_dim, embedding_dim)
+        # Output projection layer
+        self.output_projection = nn.Linear(embedding_dim, input_dim)
 
         # Activation function
         if activation == "relu":
@@ -772,6 +452,8 @@ class HAMA(nn.Module):
 
         x: [B, seq_len, embedding_dim]
         """
+        # Input projection
+        x = self.input_projection(x)  # [B, seq_len, embedding_dim]
         # Up (encode)
         for layer in self.layers:
             x = layer.encode(x)
@@ -784,11 +466,15 @@ class HAMA(nn.Module):
 
         # Final activation
         x = self.activation(x)
+        # Output projection
+        x = self.output_projection(x)
 
         return x
 
     def encode(self, x: torch.Tensor):
         """Encodes input through all HAMA layers."""
+        # Input projection
+        x = self.input_projection(x)  # [B, seq_len, embedding_dim]
         for layer in self.layers:
             x = layer.encode(x)
         # Final activation
@@ -801,6 +487,8 @@ class HAMA(nn.Module):
             x = layer.decode(x)
         # Final activation
         x = self.activation(x)
+        # Output projection
+        x = self.output_projection(x)
         return x
 
 

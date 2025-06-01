@@ -13,6 +13,7 @@ from pytorch_lightning.utilities.model_summary import ModelSummary
 from tqdm import tqdm
 
 from model import HAMAForLanguageModeling, HAMA
+from matplotlib import pyplot as plt
 
 
 class HAMALightningModule(pl.LightningModule):
@@ -180,9 +181,18 @@ class HAMALightningModule(pl.LightningModule):
                 print(f"Input: {input_text}")
                 print(f"Output: {output_text}")
             else:
+                # For non-text tasks, plot the output and input
+                fig, ax = plt.subplots()
+                ax.plot(input_tensor[0].cpu().numpy(), label='Input')
+                ax.plot(output[0].cpu().numpy(), label='Output')
+                ax.legend()
+                ax.set_title('Input vs Output')
+                ax.set_xlabel('Index')
+                ax.set_ylabel('Value')
                 self.logger.experiment.log({
-                    'val_output': output[0].cpu().numpy()
-                })
+                    'val_output': fig
+                }, commit=False)
+                plt.close(fig)
 
         self.log('val_loss', loss, prog_bar=True, sync_dist=True)
         return loss
@@ -315,9 +325,18 @@ class HAMALightningModule(pl.LightningModule):
                 print(f"Input: {input_text}")
                 print(f"Output: {output_text}")
             else:
+                # For non-text tasks, plot the output and input
+                fig, ax = plt.subplots()
+                ax.plot(x[0].cpu().numpy(), label='Input')
+                ax.plot(output[0].cpu().numpy(), label='Output')
+                ax.legend()
+                ax.set_title('Input vs Output')
+                ax.set_xlabel('Index')
+                ax.set_ylabel('Value')
                 self.logger.experiment.log({
-                    f'layer_{self.current_layer_idx}_val_output': output[0].cpu().numpy()
-                })
+                    f'layer_{self.current_layer_idx}_val_output': fig
+                }, commit=False)
+                plt.close(fig)
 
         # Compute loss
         if self.is_text_task:
@@ -493,6 +512,7 @@ class HAMADataModule(pl.LightningDataModule):
 
 
 def create_hama_for_text(
+        input_dim,
         embedding_dim,
         num_heads,
         dropout,
@@ -516,6 +536,7 @@ def create_hama_for_text(
     """
     # Create base HAMA model without embedding
     hama_base = HAMA(
+        input_dim=input_dim,
         embedding_dim=embedding_dim,
         num_heads=num_heads,
         dropout=dropout,
